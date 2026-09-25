@@ -1,0 +1,8 @@
+{
+  "name": "Salonix - Salon Appointment Booking Platform",
+  "description": "Discover salons, compare prices, check available slots and book appointments effortlessly.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
