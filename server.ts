@@ -4,7 +4,19 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { pool, query, ensureSchema } from './src/db/db.ts';
+import bcrypt from 'bcryptjs';
+import { pool, query, ensureSchema, migratePlaintextPasswords } from './src/db/db.ts';
+import { generateToken, requireAuth, requireRole, requireAdmin, requireSalonOwner, requireCustomer } from './src/middleware/auth.ts';
+import { serializeUser } from './src/lib/userSerializer.ts';
+import {
+  timeStringToMinutes,
+  minutesToDisplayTime,
+  isSalonOpenOnDate,
+  isStatusBlocking,
+  intervalsOverlap,
+  generateAvailableSlots,
+  BookedInterval,
+} from './src/lib/slotUtils.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,9 +48,27 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
 
     const user = result.rows[0];
 
-    // Check password if stored
-    if (user.password && user.password !== password && password !== 'password123' && password !== 'admin123') {
-      return res.status(401).json({ error: 'Incorrect password. Please try again.' });
+    // Secure password verification with bcrypt (no master password bypass)
+    if (!user.password) {
+      return res.status(401).json({ error: 'Incorrect email or password. Please try again.' });
+    }
+
+    const isBcrypt = user.password.startsWith('$2a$') || user.password.startsWith('$2b$') || user.password.startsWith('$2y$');
+    let passwordValid = false;
+
+    if (isBcrypt) {
+      passwordValid = await bcrypt.compare(password, user.password);
+    } else {
+      // Safe fallback for unmigrated record: strictly check user's OWN password, then upgrade to bcrypt hash
+      if (user.password === password) {
+        passwordValid = true;
+        const newHash = await bcrypt.hash(password, 10);
+        await query('UPDATE users SET password = $1 WHERE id = $2', [newHash, user.id]);
+      }
+    }
+
+    if (!passwordValid) {
+      return res.status(401).json({ error: 'Incorrect email or password. Please try again.' });
     }
 
     // Check account status
@@ -57,6 +87,62 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
 
     // If salon owner, attach salon details if available
     let salon = null;
+    let actualSalonId = user.salon_id;
+    if (user.role === 'owner') {
+      const salonRes = await query(
+        'SELECT * FROM salons WHERE owner_id = $1 OR id = $2',
+        [user.uid, user.salon_id || '']
+      );
+      if (salonRes.rows.length > 0) {
+        salon = salonRes.rows[0];
+        actualSalonId = salon.id;
+      }
+    }
+
+    const safeUser = serializeUser(user, salon);
+
+    const token = generateToken({
+      id: user.id,
+      uid: user.uid,
+      email: user.email,
+      role: user.role,
+      salonId: actualSalonId,
+    });
+
+    return res.json({
+      success: true,
+      token,
+      user: safeUser,
+    });
+  } catch (err: any) {
+    console.error('Login error:', err);
+    return res.status(500).json({ error: 'Server error during login: ' + err.message });
+  }
+});
+
+// 1b. Auth: Get Current Authenticated User (GET /api/auth/me)
+app.get('/api/auth/me', requireAuth, async (req: Request, res: Response) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized. Token missing or invalid.' });
+    }
+
+    const result = await query(
+      'SELECT id, uid, name, email, phone, role, city, status, salon_id, created_at FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User account not found.' });
+    }
+
+    const user = result.rows[0];
+
+    if (user.status === 'rejected') {
+      return res.status(403).json({ error: 'account_rejected', message: 'Account is deactivated.' });
+    }
+
+    let salon = null;
     if (user.role === 'owner') {
       const salonRes = await query(
         'SELECT * FROM salons WHERE owner_id = $1 OR id = $2',
@@ -67,24 +153,14 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
       }
     }
 
+    const safeUser = serializeUser(user, salon);
     return res.json({
       success: true,
-      user: {
-        id: user.id,
-        uid: user.uid,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        city: user.city,
-        salon_id: user.salon_id,
-        status: user.status,
-        salon,
-      }
+      user: safeUser,
     });
   } catch (err: any) {
-    console.error('Login error:', err);
-    return res.status(500).json({ error: 'Server error during login: ' + err.message });
+    console.error('Auth check error:', err);
+    return res.status(500).json({ error: 'Internal server error: ' + err.message });
   }
 });
 
@@ -109,6 +185,11 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
 
     // Check if email already registered
     const existing = await query(
@@ -209,7 +290,7 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
           city ? city.trim() : 'Pune',
           'active',
           assignedSalonId,
-          password,
+          hashedPassword,
         ]
       );
     } catch (insertErr: any) {
@@ -230,7 +311,7 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
             city ? city.trim() : 'Pune',
             'active',
             assignedSalonId,
-            password,
+            hashedPassword,
           ]
         );
       } else {
@@ -258,22 +339,21 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
       if (sRes.rows.length > 0) salonData = sRes.rows[0];
     }
 
+    const safeUser = serializeUser(newUser, salonData);
+    const token = generateToken({
+      id: newUser.id,
+      uid: newUser.uid,
+      email: newUser.email,
+      role: newUser.role,
+      salonId: assignedSalonId,
+    });
+
     return res.status(201).json({
       success: true,
       status: 'active',
+      token,
       message: 'Account registered successfully! Welcome to Salonix.',
-      user: {
-        id: newUser.id,
-        uid: newUser.uid,
-        name: newUser.name,
-        email: newUser.email,
-        phone: newUser.phone,
-        role: newUser.role,
-        city: newUser.city,
-        status: newUser.status,
-        salon_id: newUser.salon_id,
-        salon: salonData,
-      }
+      user: safeUser,
     });
   } catch (err: any) {
     console.error('Register error:', err);
@@ -282,7 +362,7 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
 });
 
 // 3. Admin: Pending Approvals
-app.get('/api/admin/pending', async (_req: Request, res: Response) => {
+app.get('/api/admin/pending', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const pendingUsers = await query(
       `SELECT u.id, u.uid, u.name, u.email, u.phone, u.role, u.city, u.status, u.salon_id, u.created_at,
@@ -313,7 +393,7 @@ app.get('/api/admin/pending', async (_req: Request, res: Response) => {
 });
 
 // 4. Admin: Approve or Reject User
-app.post('/api/admin/users/:id/action', async (req: Request, res: Response) => {
+app.post('/api/admin/users/:id/action', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { action } = req.body; // 'approve' | 'reject'
@@ -347,7 +427,7 @@ app.post('/api/admin/users/:id/action', async (req: Request, res: Response) => {
     return res.json({
       success: true,
       action,
-      user: updatedUser,
+      user: serializeUser(updatedUser),
       message: `User ${updatedUser.name} has been ${action === 'approve' ? 'approved and activated' : 'rejected'}.`
     });
   } catch (err: any) {
@@ -357,7 +437,7 @@ app.post('/api/admin/users/:id/action', async (req: Request, res: Response) => {
 });
 
 // 5. Admin: Approve or Reject Salon directly
-app.post('/api/admin/salons/:id/action', async (req: Request, res: Response) => {
+app.post('/api/admin/salons/:id/action', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { action } = req.body; // 'approve' | 'reject'
@@ -392,7 +472,7 @@ app.post('/api/admin/salons/:id/action', async (req: Request, res: Response) => 
 });
 
 // 6. Admin: All Users
-app.get('/api/admin/users', async (req: Request, res: Response) => {
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { status, role } = req.query;
     let sql = `SELECT u.id, u.uid, u.name, u.email, u.phone, u.role, u.city, u.status, u.salon_id, u.created_at,
@@ -421,7 +501,7 @@ app.get('/api/admin/users', async (req: Request, res: Response) => {
 });
 
 // 7. Admin: Platform Stats
-app.get('/api/admin/stats', async (_req: Request, res: Response) => {
+app.get('/api/admin/stats', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const [pendingRes, usersRes, salonsRes, appointmentsRes] = await Promise.all([
       query(`SELECT COUNT(*) FROM users WHERE status = 'pending'`),
@@ -501,6 +581,126 @@ app.get('/api/salons/:id', async (req: Request, res: Response) => {
   }
 });
 
+// 9b. Salon Available Slots (Dynamic calculation based on hours, break, duration, bookings)
+app.get('/api/salons/:id/slots', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { date, serviceId } = req.query;
+
+    if (!date || typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'Valid date query parameter (YYYY-MM-DD) is required.' });
+    }
+
+    if (!serviceId || typeof serviceId !== 'string') {
+      return res.status(400).json({ error: 'serviceId query parameter is required.' });
+    }
+
+    // 1. Fetch salon
+    const salonRes = await query('SELECT * FROM salons WHERE id = $1', [id]);
+    if (salonRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Salon not found.' });
+    }
+    const salon = salonRes.rows[0];
+
+    // Check salon status
+    if (salon.status !== 'approved') {
+      return res.status(400).json({ error: 'Salon is not currently approved for bookings.' });
+    }
+
+    // 2. Fetch service
+    const srvRes = await query('SELECT * FROM services WHERE id = $1', [serviceId]);
+    if (srvRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Service not found.' });
+    }
+    const service = srvRes.rows[0];
+
+    // 3. Verify service belongs to requested salon
+    if (service.salon_id !== salon.id) {
+      return res.status(400).json({ error: 'Requested service does not belong to this salon.' });
+    }
+
+    if (service.status && service.status !== 'active') {
+      return res.status(400).json({ error: 'Service is currently inactive.' });
+    }
+
+    // 4. Verify salon is open on this day of week
+    if (!isSalonOpenOnDate(salon.working_days, date)) {
+      return res.json({
+        available: false,
+        reason: 'Salon is closed on this day.',
+        date,
+        service: {
+          id: service.id,
+          name: service.name,
+          duration: service.duration,
+          price: service.price,
+        },
+        slots: [],
+      });
+    }
+
+    // 5. Query active, blocking appointments on this date
+    const aptsRes = await query(
+      `SELECT start_time, end_time, duration_minutes, status 
+       FROM appointments 
+       WHERE salon_id = $1 AND date = $2`,
+      [salon.id, date]
+    );
+
+    const bookedIntervals: BookedInterval[] = [];
+    for (const apt of aptsRes.rows) {
+      if (isStatusBlocking(apt.status)) {
+        const startMin = timeStringToMinutes(apt.start_time);
+        if (startMin !== null) {
+          const dur = Number(apt.duration_minutes) || 30;
+          let endMin = timeStringToMinutes(apt.end_time);
+          if (endMin === null || endMin <= startMin) {
+            endMin = startMin + dur;
+          }
+          bookedIntervals.push({ startMinutes: startMin, endMinutes: endMin });
+        }
+      }
+    }
+
+    // 6. Generate available slots
+    const slots = generateAvailableSlots({
+      openingTime: salon.opening_time || '09:00',
+      closingTime: salon.closing_time || '20:00',
+      breakStartTime: salon.break_start_time,
+      breakEndTime: salon.break_end_time,
+      workingDays: salon.working_days,
+      slotStepMinutes: salon.slot_duration_minutes || 30,
+      serviceDurationMinutes: Number(service.duration) || 30,
+      dateStr: date,
+      bookedIntervals,
+    });
+
+    return res.json({
+      available: true,
+      date,
+      salonId: salon.id,
+      salonName: salon.name,
+      service: {
+        id: service.id,
+        name: service.name,
+        duration: Number(service.duration),
+        price: Number(service.price),
+      },
+      workingHours: {
+        openingTime: salon.opening_time,
+        closingTime: salon.closing_time,
+        breakStartTime: salon.break_start_time,
+        breakEndTime: salon.break_end_time,
+      },
+      slots,
+      totalSlots: slots.length,
+    });
+  } catch (err: any) {
+    console.error('Fetch slots error:', err);
+    return res.status(500).json({ error: 'Failed to calculate available slots: ' + err.message });
+  }
+});
+
 // 10. Categories
 app.get('/api/categories', async (_req: Request, res: Response) => {
   try {
@@ -512,25 +712,39 @@ app.get('/api/categories', async (_req: Request, res: Response) => {
   }
 });
 
-// 11. Appointments: Get list
-app.get('/api/appointments', async (req: Request, res: Response) => {
+// 11. Appointments: Get list (Protected: scoped by role & ownership)
+app.get('/api/appointments', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { customerId, salonId, userEmail, all } = req.query;
+    const authUser = req.user!;
     let sql = 'SELECT * FROM appointments WHERE 1=1';
     const params: any[] = [];
 
-    if (customerId) {
-      params.push(customerId);
-      sql += ` AND customer_id = $${params.length}`;
-    } else if (userEmail) {
-      params.push(userEmail);
-      sql += ` AND LOWER(customer_email) = LOWER($${params.length})`;
-    } else if (salonId) {
-      params.push(salonId);
-      sql += ` AND salon_id = $${params.length}`;
-    } else if (all !== 'true') {
-      // Return empty if no filter provided for non-admin
-      return res.json({ appointments: [] });
+    if (authUser.role === 'customer') {
+      // Customers can only see their own appointments
+      sql += ` AND (customer_id = $1 OR LOWER(customer_email) = LOWER($2))`;
+      params.push(authUser.uid, authUser.email);
+    } else if (authUser.role === 'owner') {
+      // Salon owners can only see appointments belonging to their own salon
+      if (!authUser.salonId) {
+        return res.json({ appointments: [] });
+      }
+      sql += ` AND salon_id = $1`;
+      params.push(authUser.salonId);
+    } else if (authUser.role === 'admin') {
+      // Admin can view all or filter by query params
+      const { customerId, salonId, userEmail } = req.query;
+      if (customerId) {
+        params.push(customerId);
+        sql += ` AND customer_id = $${params.length}`;
+      } else if (userEmail) {
+        params.push(userEmail);
+        sql += ` AND LOWER(customer_email) = LOWER($${params.length})`;
+      } else if (salonId) {
+        params.push(salonId);
+        sql += ` AND salon_id = $${params.length}`;
+      }
+    } else {
+      return res.status(403).json({ error: 'Access denied.' });
     }
 
     sql += ' ORDER BY created_at DESC';
@@ -542,34 +756,158 @@ app.get('/api/appointments', async (req: Request, res: Response) => {
   }
 });
 
-// 12. Appointments: Create (Book slot)
-app.post('/api/appointments', async (req: Request, res: Response) => {
+// 12. Appointments: Create (Book slot - strictly server-validated, transaction-safe)
+app.post('/api/appointments', requireAuth, async (req: Request, res: Response) => {
+  const client = await pool.connect();
   try {
+    const authUser = req.user!;
     const {
-      customerId,
       customerName,
       customerPhone,
       customerEmail,
       salonId,
-      salonName,
-      salonCity,
-      salonAddress,
       serviceId,
-      serviceName,
       date,
       startTime,
-      endTime,
-      durationMinutes = 30,
-      price = 300,
       notes = '',
     } = req.body;
 
-    if (!customerName || !customerPhone || !salonId || !serviceName || !date || !startTime) {
-      return res.status(400).json({ error: 'Please provide all required appointment details' });
+    // 1. Validate mandatory fields
+    if (!customerName || !customerPhone || !salonId || !serviceId || !date || !startTime) {
+      return res.status(400).json({ error: 'Please provide all required appointment details (customerName, customerPhone, salonId, serviceId, date, startTime).' });
     }
 
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ error: 'Invalid date format. Expected YYYY-MM-DD.' });
+    }
+
+    // 2. Customer identity comes strictly from req.user
+    let bookingCustomerId = authUser.uid;
+    let bookingCustomerEmail = authUser.email;
+    if (authUser.role === 'admin' && req.body.customerId) {
+      bookingCustomerId = req.body.customerId;
+      bookingCustomerEmail = customerEmail || authUser.email;
+    }
+
+    // 3. Begin transaction
+    await client.query('BEGIN');
+
+    // 4. Retrieve and lock salon record inside transaction
+    const salonRes = await client.query('SELECT * FROM salons WHERE id = $1 FOR SHARE', [salonId]);
+    if (salonRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Salon not found.' });
+    }
+    const salon = salonRes.rows[0];
+
+    if (salon.status !== 'approved') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Salon is not currently approved for bookings.' });
+    }
+
+    // 5. Retrieve service from database inside transaction
+    const srvRes = await client.query('SELECT * FROM services WHERE id = $1', [serviceId]);
+    if (srvRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Service not found.' });
+    }
+    const service = srvRes.rows[0];
+
+    // 6. Verify service belongs to requested salon
+    if (service.salon_id !== salon.id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Requested service does not belong to this salon.' });
+    }
+
+    if (service.status && service.status !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Service is currently inactive.' });
+    }
+
+    // 7. Canonical values from database
+    const canonicalServiceName = service.name;
+    const canonicalPrice = Number(service.price);
+    const canonicalDuration = Number(service.duration) || 30;
+
+    // 8. Verify salon is open on this day
+    if (!isSalonOpenOnDate(salon.working_days, date)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Salon is closed on the selected date.' });
+    }
+
+    // 9. Time calculations and working hours verification
+    const startMinutes = timeStringToMinutes(startTime);
+    if (startMinutes === null) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid start time format.' });
+    }
+
+    const endMinutes = startMinutes + canonicalDuration;
+    const openMinutes = timeStringToMinutes(salon.opening_time || '09:00');
+    const closeMinutes = timeStringToMinutes(salon.closing_time || '20:00');
+
+    if (openMinutes === null || closeMinutes === null || openMinutes >= closeMinutes) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Invalid salon operating hours configuration.' });
+    }
+
+    // Check bounds: must start after opening and finish before or at closing
+    if (startMinutes < openMinutes || endMinutes > closeMinutes) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: `Requested appointment time (${minutesToDisplayTime(startMinutes)} - ${minutesToDisplayTime(endMinutes)}) falls outside salon working hours (${minutesToDisplayTime(openMinutes)} - ${minutesToDisplayTime(closeMinutes)}).`,
+      });
+    }
+
+    // 10. Verify break hours
+    const breakStart = timeStringToMinutes(salon.break_start_time);
+    const breakEnd = timeStringToMinutes(salon.break_end_time);
+    if (breakStart !== null && breakEnd !== null && breakStart < breakEnd) {
+      if (intervalsOverlap(startMinutes, endMinutes, breakStart, breakEnd)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          error: `Requested appointment overlaps salon break hours (${minutesToDisplayTime(breakStart)} - ${minutesToDisplayTime(breakEnd)}).`,
+        });
+      }
+    }
+
+    // 11. Concurrency control: Lock existing appointments for this salon and date to prevent race conditions
+    const existingAptsRes = await client.query(
+      `SELECT id, start_time, end_time, duration_minutes, status
+       FROM appointments
+       WHERE salon_id = $1 AND date = $2
+       FOR UPDATE`,
+      [salon.id, date]
+    );
+
+    // Re-check slot availability inside the lock
+    for (const apt of existingAptsRes.rows) {
+      if (isStatusBlocking(apt.status)) {
+        const existingStart = timeStringToMinutes(apt.start_time);
+        if (existingStart !== null) {
+          const existingDur = Number(apt.duration_minutes) || 30;
+          let existingEnd = timeStringToMinutes(apt.end_time);
+          if (existingEnd === null || existingEnd <= existingStart) {
+            existingEnd = existingStart + existingDur;
+          }
+
+          if (intervalsOverlap(startMinutes, endMinutes, existingStart, existingEnd)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              error: 'Slot conflict',
+              message: 'This slot is no longer available. Please select another time.',
+            });
+          }
+        }
+      }
+    }
+
+    // 12. Insert the appointment with server-calculated fields
     const appointmentId = `apt-${Date.now()}`;
-    const result = await query(
+    const calculatedStartTime = minutesToDisplayTime(startMinutes);
+    const calculatedEndTime = minutesToDisplayTime(endMinutes);
+
+    const insertRes = await client.query(
       `INSERT INTO appointments (
         id, customer_id, customer_name, customer_phone, customer_email,
         salon_id, salon_name, salon_city, salon_address,
@@ -583,41 +921,80 @@ app.post('/api/appointments', async (req: Request, res: Response) => {
       ) RETURNING *`,
       [
         appointmentId,
-        customerId || `guest-${Date.now().toString().slice(-4)}`,
+        bookingCustomerId,
         customerName.trim(),
         customerPhone.trim(),
-        customerEmail ? customerEmail.trim() : '',
-        salonId,
-        salonName || 'Salon Partner',
-        salonCity || 'Pune',
-        salonAddress || '',
-        serviceId || 'srv-custom',
-        serviceName,
+        bookingCustomerEmail ? bookingCustomerEmail.trim() : '',
+        salon.id,
+        salon.name,
+        salon.city,
+        salon.address,
+        service.id,
+        canonicalServiceName,
         date,
-        startTime,
-        endTime || startTime,
-        Number(durationMinutes) || 30,
-        Number(price) || 250,
+        calculatedStartTime,
+        calculatedEndTime,
+        canonicalDuration,
+        canonicalPrice,
         notes || '',
       ]
     );
 
+    // 13. Commit transaction
+    await client.query('COMMIT');
+
     return res.status(201).json({
       success: true,
-      appointment: result.rows[0],
-      message: 'Appointment booked successfully!'
+      appointment: insertRes.rows[0],
+      message: 'Appointment booked successfully!',
     });
   } catch (err: any) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {}
     console.error('Booking error:', err);
     return res.status(500).json({ error: 'Failed to book appointment: ' + err.message });
+  } finally {
+    client.release();
   }
 });
 
-// 13. Appointments: Update Status (Accept / Complete / Cancel)
-app.patch('/api/appointments/:id/status', async (req: Request, res: Response) => {
+// 13. Appointments: Update Status (Accept / Complete / Cancel - strictly authorized)
+app.patch('/api/appointments/:id/status', requireAuth, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status, cancellationReason } = req.body;
+    const authUser = req.user!;
+
+    // First fetch the appointment to check authorization
+    const aptRes = await query('SELECT * FROM appointments WHERE id = $1', [id]);
+    if (aptRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
+
+    const apt = aptRes.rows[0];
+
+    // Verify permission:
+    // Admin: can update any appointment
+    // Owner: can only update appointments for their own salon
+    // Customer: can only cancel their own appointment
+    if (authUser.role === 'admin') {
+      // Allowed
+    } else if (authUser.role === 'owner') {
+      if (!authUser.salonId || apt.salon_id !== authUser.salonId) {
+        return res.status(403).json({ error: 'Forbidden. You can only update appointments for your own salon.' });
+      }
+    } else if (authUser.role === 'customer') {
+      const isOwner = apt.customer_id === authUser.uid || (apt.customer_email && apt.customer_email.toLowerCase() === authUser.email.toLowerCase());
+      if (!isOwner) {
+        return res.status(403).json({ error: 'Forbidden. You can only modify your own appointments.' });
+      }
+      if (status !== 'cancelled') {
+        return res.status(403).json({ error: 'Forbidden. Customers may only cancel appointments.' });
+      }
+    } else {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
 
     const result = await query(
       `UPDATE appointments
@@ -626,10 +1003,6 @@ app.patch('/api/appointments/:id/status', async (req: Request, res: Response) =>
        RETURNING *`,
       [status, cancellationReason || null, id]
     );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Appointment not found' });
-    }
 
     return res.json({
       success: true,
@@ -641,11 +1014,32 @@ app.patch('/api/appointments/:id/status', async (req: Request, res: Response) =>
   }
 });
 
-// 14. Salon Owner: Add Service
-app.post('/api/services', async (req: Request, res: Response) => {
+// 14. Services: Add Service (Owner of that salon or Admin only)
+app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
   try {
+    const authUser = req.user!;
     const { salonId, categoryId, name, description, price, duration } = req.body;
-    if (!salonId || !name || !price) {
+
+    // Role check: Only salon owners and admin can manage services
+    if (authUser.role === 'customer') {
+      return res.status(403).json({ error: 'Forbidden. Customers cannot create or modify services.' });
+    }
+
+    // Determine target salonId:
+    // If salon owner, strictly derive and enforce their own salonId from JWT
+    let targetSalonId = salonId;
+    if (authUser.role === 'owner') {
+      if (!authUser.salonId) {
+        return res.status(403).json({ error: 'Forbidden. No salon assigned to your account.' });
+      }
+      // Never trust client salonId if owner attempts to specify another salon
+      if (salonId && salonId !== authUser.salonId) {
+        return res.status(403).json({ error: 'Forbidden. You can only add services to your own salon.' });
+      }
+      targetSalonId = authUser.salonId;
+    }
+
+    if (!targetSalonId || !name || price === undefined || price === null || price === '') {
       return res.status(400).json({ error: 'Salon ID, service name, and price are required' });
     }
 
@@ -656,7 +1050,7 @@ app.post('/api/services', async (req: Request, res: Response) => {
        RETURNING *`,
       [
         srvId,
-        salonId,
+        targetSalonId,
         categoryId || 'cat-hair',
         name.trim(),
         description || '',
@@ -675,16 +1069,103 @@ app.post('/api/services', async (req: Request, res: Response) => {
   }
 });
 
+// 14b. Services: Update Service (Owner of that salon or Admin only)
+app.patch('/api/services/:id', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = req.user!;
+    const { id } = req.params;
+    const { name, description, price, duration, categoryId, status } = req.body;
+
+    if (authUser.role === 'customer') {
+      return res.status(403).json({ error: 'Forbidden. Customers cannot create or modify services.' });
+    }
+
+    // Fetch existing service to verify ownership
+    const srvRes = await query('SELECT * FROM services WHERE id = $1', [id]);
+    if (srvRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Service not found.' });
+    }
+
+    const service = srvRes.rows[0];
+
+    // Salon owner may only mutate services belonging to their own salon
+    if (authUser.role === 'owner') {
+      if (!authUser.salonId || service.salon_id !== authUser.salonId) {
+        return res.status(403).json({ error: 'Forbidden. You can only update services belonging to your own salon.' });
+      }
+    }
+
+    const updatedName = name !== undefined ? name.trim() : service.name;
+    const updatedDesc = description !== undefined ? description : service.description;
+    const updatedPrice = price !== undefined ? Number(price) : service.price;
+    const updatedDuration = duration !== undefined ? Number(duration) : service.duration;
+    const updatedCat = categoryId !== undefined ? categoryId : service.category_id;
+    const updatedStatus = status !== undefined ? status : service.status;
+
+    const result = await query(
+      `UPDATE services
+       SET name = $1, description = $2, price = $3, duration = $4, category_id = $5, status = $6
+       WHERE id = $7
+       RETURNING *`,
+      [updatedName, updatedDesc, updatedPrice, updatedDuration, updatedCat, updatedStatus, id]
+    );
+
+    return res.json({
+      success: true,
+      service: result.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Update service error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 14c. Services: Delete Service (Owner of that salon or Admin only)
+app.delete('/api/services/:id', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = req.user!;
+    const { id } = req.params;
+
+    if (authUser.role === 'customer') {
+      return res.status(403).json({ error: 'Forbidden. Customers cannot delete services.' });
+    }
+
+    const srvRes = await query('SELECT * FROM services WHERE id = $1', [id]);
+    if (srvRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Service not found.' });
+    }
+
+    const service = srvRes.rows[0];
+
+    if (authUser.role === 'owner') {
+      if (!authUser.salonId || service.salon_id !== authUser.salonId) {
+        return res.status(403).json({ error: 'Forbidden. You can only delete services belonging to your own salon.' });
+      }
+    }
+
+    await query('DELETE FROM services WHERE id = $1', [id]);
+
+    return res.json({
+      success: true,
+      message: 'Service deleted successfully.',
+    });
+  } catch (err: any) {
+    console.error('Delete service error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Vite Middleware for Development / Static serving for Production
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
   const distPath = path.resolve(__dirname, 'dist');
 
-  // Verify and migrate database schema on startup
+  // Verify database schema and safely migrate plaintext passwords on startup
   try {
     await ensureSchema();
+    await migratePlaintextPasswords();
   } catch (schemaErr) {
-    console.warn('[DB] Schema ensure warning on startup:', schemaErr);
+    console.warn('[DB] Schema/password initialization warning on startup:', schemaErr);
   }
 
   if (isProd) {

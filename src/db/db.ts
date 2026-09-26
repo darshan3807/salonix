@@ -1,5 +1,6 @@
 import pg from 'pg';
 import fs from 'fs';
+import bcrypt from 'bcryptjs';
 
 const { Pool } = pg;
 
@@ -12,12 +13,19 @@ try {
   console.warn('Could not read /app/.dev.env.json:', e);
 }
 
+// Database configuration strictly derived from environment variables
+const host = process.env.SQL_HOST || devConfig.SQL_HOST || 'localhost';
+const port = Number(process.env.SQL_PORT || devConfig.SQL_PORT) || 5432;
+const user = process.env.SQL_USER || devConfig.SQL_USER || 'postgres';
+const password = process.env.SQL_PASSWORD || devConfig.SQL_PASSWORD;
+const database = process.env.SQL_DATABASE || process.env.SQL_DB_NAME || devConfig.SQL_DATABASE || devConfig.SQL_DB_NAME || 'salonix';
+
 export const pool = new Pool({
-  host: process.env.SQL_HOST || devConfig.SQL_HOST || '/app/cloudsql/inductive-sorter-57krv:asia-southeast1:ai-studio-ed584842',
-  user: process.env.SQL_USER || devConfig.SQL_USER || 'ai_studio_app_user',
-  password: process.env.SQL_PASSWORD || devConfig.SQL_PASSWORD || '/5I]yWp&s;#pJ^L(',
-  database: process.env.SQL_DB_NAME || devConfig.SQL_DB_NAME || 'cloud_sql_development_database',
-  port: 5432,
+  host,
+  port,
+  user,
+  password,
+  database,
 });
 
 pool.on('error', (err) => {
@@ -28,7 +36,6 @@ export async function query(text: string, params?: any[]) {
   const start = Date.now();
   const res = await pool.query(text, params);
   const duration = Date.now() - start;
-  // silent log
   return res;
 }
 
@@ -54,7 +61,7 @@ export async function ensureSchema() {
           city TEXT DEFAULT 'Pune',
           status TEXT DEFAULT 'active',
           salon_id TEXT,
-          password TEXT DEFAULT 'password123',
+          password TEXT,
           created_at TIMESTAMP DEFAULT NOW()
         );
       `);
@@ -62,7 +69,7 @@ export async function ensureSchema() {
       // Table exists, verify required columns
       const existingCols = new Set(check.rows.map((r: any) => r.column_name));
       if (!existingCols.has('password')) {
-        await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password text DEFAULT 'password123';`);
+        await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password text;`);
       }
       if (!existingCols.has('status')) {
         await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status text DEFAULT 'active';`);
@@ -110,10 +117,43 @@ export async function ensureSchema() {
   }
 }
 
-// Automatically verify schema on initialization
-ensureSchema().catch((err) => {
-  if (err.message && !err.message.includes('permission denied')) {
-    console.warn('[DB] Auto schema sync notice:', err.message || err);
+/**
+ * Safe, non-destructive migration that converts any plaintext passwords in PostgreSQL
+ * to standard bcrypt hashes, ensuring development and demo accounts remain usable.
+ */
+export async function migratePlaintextPasswords() {
+  try {
+    const res = await query('SELECT id, email, password FROM users;');
+    let migrated = 0;
+    for (const u of res.rows) {
+      if (!u.password) {
+        const hash = await bcrypt.hash('password123', 10);
+        await query('UPDATE users SET password = $1 WHERE id = $2;', [hash, u.id]);
+        migrated++;
+      } else {
+        const isBcrypt = u.password.startsWith('$2a$') || u.password.startsWith('$2b$') || u.password.startsWith('$2y$');
+        if (!isBcrypt) {
+          const hash = await bcrypt.hash(u.password, 10);
+          await query('UPDATE users SET password = $1 WHERE id = $2;', [hash, u.id]);
+          migrated++;
+        }
+      }
+    }
+    if (migrated > 0) {
+      console.log(`[DB Security] Successfully migrated ${migrated} user password(s) to bcrypt hashes.`);
+    }
+  } catch (err: any) {
+    console.warn('[DB Security] Password migration notice:', err.message || err);
   }
-});
+}
+
+// Automatically verify schema and run password migration on startup
+ensureSchema()
+  .then(() => migratePlaintextPasswords())
+  .catch((err) => {
+    if (err.message && !err.message.includes('permission denied')) {
+      console.warn('[DB] Auto schema sync notice:', err.message || err);
+    }
+  });
+
 

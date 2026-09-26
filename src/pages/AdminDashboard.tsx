@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext.tsx';
+import { apiFetch } from '../lib/api.ts';
 import { 
   Users, Store, CheckCircle2, XCircle, Clock, AlertTriangle, 
   Shield, Calendar, Search, Filter, RefreshCw, ChevronRight, Check, X, Sparkles
@@ -29,11 +30,11 @@ export const AdminDashboard: React.FC = () => {
     setIsLoading(true);
     try {
       const [pendingRes, usersRes, salonsRes, appointmentsRes, statsRes] = await Promise.all([
-        fetch('/api/admin/pending'),
-        fetch('/api/admin/users'),
-        fetch('/api/salons?all=true'),
-        fetch('/api/appointments?all=true'),
-        fetch('/api/admin/stats'),
+        apiFetch('/api/admin/pending'),
+        apiFetch('/api/admin/users'),
+        apiFetch('/api/salons?all=true'),
+        apiFetch('/api/appointments?all=true'),
+        apiFetch('/api/admin/stats'),
       ]);
 
       if (pendingRes.ok) {
@@ -70,9 +71,8 @@ export const AdminDashboard: React.FC = () => {
 
   const handleUserAction = async (userId: number, action: 'approve' | 'reject', userName: string) => {
     try {
-      const res = await fetch(`/api/admin/users/${userId}/action`, {
+      const res = await apiFetch(`/api/admin/users/${userId}/action`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
 
@@ -92,9 +92,8 @@ export const AdminDashboard: React.FC = () => {
 
   const handleSalonAction = async (salonId: string, action: 'approve' | 'reject', salonName: string) => {
     try {
-      const res = await fetch(`/api/admin/salons/${salonId}/action`, {
+      const res = await apiFetch(`/api/admin/salons/${salonId}/action`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
 

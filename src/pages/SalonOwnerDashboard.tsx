@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Salon, Service, Appointment } from '../types/index.ts';
+import { apiFetch } from '../lib/api.ts';
 import { 
   Store, Clock, MapPin, Calendar, Scissors, Plus, CheckCircle, 
   XCircle, Check, X, AlertTriangle, ShieldCheck, DollarSign
@@ -27,30 +28,34 @@ export const SalonOwnerDashboard: React.FC = () => {
     if (!user) return;
     setIsLoading(true);
     try {
-      // Find salon for this owner
-      const salonsRes = await fetch('/api/salons?all=true');
+      // Find salon for this owner strictly belonging to this authenticated user
+      const salonsRes = await apiFetch('/api/salons?all=true');
       if (salonsRes.ok) {
         const data = await salonsRes.json();
         const found = (data.salons || []).find(
-          (s: Salon) => s.owner_id === user.uid || s.id === user.salon_id
-        ) || data.salons[0];
+          (s: Salon) => s.owner_id === user.uid || s.id === (user.salon_id || user.salonId)
+        );
 
         if (found) {
           setSalon(found);
 
           // Fetch services for this salon
-          const detailsRes = await fetch(`/api/salons/${found.id}`);
+          const detailsRes = await apiFetch(`/api/salons/${found.id}`);
           if (detailsRes.ok) {
             const details = await detailsRes.json();
             setServices(details.services || []);
           }
 
           // Fetch appointments for this salon
-          const aptRes = await fetch(`/api/appointments?salonId=${found.id}`);
+          const aptRes = await apiFetch(`/api/appointments?salonId=${found.id}`);
           if (aptRes.ok) {
             const aptData = await aptRes.json();
             setAppointments(aptData.appointments || []);
           }
+        } else {
+          setSalon(null);
+          setServices([]);
+          setAppointments([]);
         }
       }
     } catch (e) {
@@ -66,9 +71,8 @@ export const SalonOwnerDashboard: React.FC = () => {
 
   const handleUpdateStatus = async (appointmentId: string, status: 'confirmed' | 'completed' | 'cancelled') => {
     try {
-      const res = await fetch(`/api/appointments/${appointmentId}/status`, {
+      const res = await apiFetch(`/api/appointments/${appointmentId}/status`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),
       });
 
@@ -88,9 +92,8 @@ export const SalonOwnerDashboard: React.FC = () => {
 
     setIsAddingService(true);
     try {
-      const res = await fetch('/api/services', {
+      const res = await apiFetch('/api/services', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           salonId: salon.id,
           name: newServiceName,

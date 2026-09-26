@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { User, Salon, Category } from '../types/index.ts';
+import { getAuthToken, setAuthToken, apiFetch } from '../lib/api.ts';
 
 export type ViewType = 
   | 'home' 
@@ -30,16 +31,7 @@ interface AppContextType {
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // IMPORTANT: Default state is unauthenticated (null), landing on the main home page!
-  const [user, setUser] = useState<User | null>(() => {
-    try {
-      const stored = localStorage.getItem('salonix_auth_user');
-      return stored ? JSON.parse(stored) : null;
-    } catch {
-      return null;
-    }
-  });
-
+  const [user, setUser] = useState<User | null>(null);
   const [currentView, setCurrentView] = useState<ViewType>('home');
   const [selectedSalonId, setSelectedSalonId] = useState<string | null>(null);
   const [salons, setSalons] = useState<Salon[]>([]);
@@ -73,7 +65,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const fetchPendingCount = async () => {
     try {
-      const res = await fetch('/api/admin/stats');
+      const res = await apiFetch('/api/admin/stats');
       if (res.ok) {
         const data = await res.json();
         setPendingApprovalsCount(data.pendingApprovals || 0);
@@ -83,12 +75,39 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
+  // Restore authenticated session from backend via GET /api/auth/me using stored JWT
   useEffect(() => {
     const init = async () => {
       setIsLoading(true);
-      await Promise.all([fetchSalons(), fetchCategories(), fetchPendingCount()]);
+
+      const token = getAuthToken();
+      if (token) {
+        try {
+          const meRes = await apiFetch('/api/auth/me');
+          if (meRes.ok) {
+            const meData = await meRes.json();
+            if (meData.success && meData.user) {
+              setUser(meData.user);
+            } else {
+              setAuthToken(null);
+              setUser(null);
+            }
+          } else {
+            // Token invalid, expired, or user deactivated
+            setAuthToken(null);
+            setUser(null);
+          }
+        } catch {
+          // If offline or network error, do not assume authenticated
+          setAuthToken(null);
+          setUser(null);
+        }
+      }
+
+      await Promise.all([fetchSalons(), fetchCategories()]);
       setIsLoading(false);
     };
+
     init();
   }, []);
 
@@ -110,19 +129,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       }
 
-      if (data.success && data.user) {
+      if (data.success && data.user && data.token) {
+        // Store JWT token securely in localStorage for apiFetch
+        setAuthToken(data.token);
         setUser(data.user);
-        try {
-          localStorage.setItem('salonix_auth_user', JSON.stringify(data.user));
-        } catch {}
 
-        // Route to the dashboard respect to login role
+        // Route to the dashboard respective to login role
         if (data.user.role === 'customer') {
           setCurrentView('customer-dashboard');
         } else if (data.user.role === 'owner') {
           setCurrentView('owner-dashboard');
         } else if (data.user.role === 'admin') {
           setCurrentView('admin-dashboard');
+          fetchPendingCount();
         } else {
           setCurrentView('home');
         }
@@ -153,11 +172,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         };
       }
 
+      // If token returned on register
+      if (data.token) {
+        setAuthToken(data.token);
+      }
+
       if (data.user) {
         setUser(data.user);
-        try {
-          localStorage.setItem('salonix_auth_user', JSON.stringify(data.user));
-        } catch {}
 
         if (data.user.role === 'customer') {
           setCurrentView('customer-dashboard');
@@ -170,7 +191,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Refresh data
       fetchSalons();
-      fetchPendingCount();
 
       return {
         success: true,
@@ -183,10 +203,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const logout = () => {
+    setAuthToken(null);
     setUser(null);
-    try {
-      localStorage.removeItem('salonix_auth_user');
-    } catch {}
     setCurrentView('home');
   };
 

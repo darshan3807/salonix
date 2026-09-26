@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Salon, Service } from '../types/index.ts';
+import { apiFetch } from '../lib/api.ts';
 import { 
   ArrowLeft, Star, MapPin, Clock, Phone, Mail, 
   Scissors, Check, Calendar, CheckCircle2, ShieldCheck, X
@@ -18,7 +19,11 @@ export const SalonDetailPage: React.FC = () => {
     const today = new Date();
     return today.toISOString().split('T')[0];
   });
-  const [selectedSlot, setSelectedSlot] = useState<string>('10:30 AM');
+  const [selectedSlot, setSelectedSlot] = useState<string>('');
+  const [availableSlots, setAvailableSlots] = useState<string[]>([]);
+  const [isSlotsLoading, setIsSlotsLoading] = useState<boolean>(false);
+  const [slotsClosedMessage, setSlotsClosedMessage] = useState<string | null>(null);
+
   const [customerName, setCustomerName] = useState<string>(user?.name || '');
   const [customerPhone, setCustomerPhone] = useState<string>(user?.phone || '');
   const [customerEmail, setCustomerEmail] = useState<string>(user?.email || '');
@@ -56,16 +61,52 @@ export const SalonDetailPage: React.FC = () => {
     fetchSalonDetails();
   }, [selectedSalonId]);
 
-  const timeSlots = [
-    '09:30 AM', '10:15 AM', '11:00 AM', '11:45 AM',
-    '01:30 PM', '02:15 PM', '03:00 PM', '04:00 PM',
-    '05:00 PM', '05:45 PM', '06:30 PM', '07:15 PM'
-  ];
+  // Dynamic slot availability fetch function
+  const fetchAvailableSlots = async (salonId: string, serviceId: string, date: string) => {
+    setIsSlotsLoading(true);
+    setSlotsClosedMessage(null);
+    try {
+      const res = await fetch(`/api/salons/${salonId}/slots?date=${encodeURIComponent(date)}&serviceId=${encodeURIComponent(serviceId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.available === false) {
+          setAvailableSlots([]);
+          setSelectedSlot('');
+          setSlotsClosedMessage(data.reason || 'Salon is closed on this day.');
+        } else {
+          const slotList = (data.slots || []).map((s: any) => s.slot);
+          setAvailableSlots(slotList);
+          // Keep selected slot if still valid, otherwise pick first available slot
+          setSelectedSlot((prev) => (slotList.includes(prev) ? prev : (slotList[0] || '')));
+        }
+      } else {
+        setAvailableSlots([]);
+        setSelectedSlot('');
+      }
+    } catch (e) {
+      console.error('Error fetching available slots:', e);
+      setAvailableSlots([]);
+      setSelectedSlot('');
+    } finally {
+      setIsSlotsLoading(false);
+    }
+  };
+
+  // Fetch slots whenever bookingService or bookingDate changes
+  useEffect(() => {
+    if (salon && bookingService && bookingDate) {
+      fetchAvailableSlots(salon.id, bookingService.id, bookingDate);
+    }
+  }, [salon, bookingService, bookingDate]);
 
   const handleBookAppointment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!salon || !bookingService || !customerName || !customerPhone) {
-      setErrorMsg('Please enter your name, phone number, and choose a time slot.');
+      setErrorMsg('Please enter your name, phone number, and choose an available time slot.');
+      return;
+    }
+    if (!selectedSlot) {
+      setErrorMsg('Please select an available time slot.');
       return;
     }
 
@@ -73,33 +114,34 @@ export const SalonDetailPage: React.FC = () => {
     setErrorMsg(null);
 
     try {
-      const res = await fetch('/api/appointments', {
+      const res = await apiFetch('/api/appointments', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          customerId: user?.uid || `guest-${Date.now().toString().slice(-4)}`,
           customerName,
           customerPhone,
           customerEmail,
           salonId: salon.id,
-          salonName: salon.name,
-          salonCity: salon.city,
-          salonAddress: salon.address,
           serviceId: bookingService.id,
-          serviceName: bookingService.name,
           date: bookingDate,
           startTime: selectedSlot,
-          durationMinutes: bookingService.duration,
-          price: bookingService.price,
           notes,
         }),
       });
 
       const data = await res.json();
+
+      if (res.status === 409) {
+        // Double booking conflict UX
+        setErrorMsg('This slot is no longer available. Please select another time.');
+        // Refresh available slots immediately
+        await fetchAvailableSlots(salon.id, bookingService.id, bookingDate);
+        return;
+      }
+
       if (res.ok && data.success) {
         setBookingSuccess(data.appointment);
       } else {
-        setErrorMsg(data.error || 'Booking failed');
+        setErrorMsg(data.error || data.message || 'Booking failed');
       }
     } catch (err: any) {
       setErrorMsg('Network error: ' + err.message);
@@ -327,25 +369,47 @@ export const SalonDetailPage: React.FC = () => {
 
                   {/* Slot selector */}
                   <div>
-                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5">
-                      Select Available Time Slot
-                    </label>
-                    <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-                      {timeSlots.map((slot) => (
-                        <button
-                          key={slot}
-                          type="button"
-                          onClick={() => setSelectedSlot(slot)}
-                          className={`py-2 px-2 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
-                            selectedSlot === slot
-                              ? 'bg-purple-600 text-white border-purple-600 shadow-xs'
-                              : 'bg-slate-50 text-slate-700 border-slate-200 hover:border-purple-400'
-                          }`}
-                        >
-                          {slot}
-                        </button>
-                      ))}
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="block text-xs font-bold uppercase tracking-wider text-slate-700">
+                        Select Available Time Slot
+                      </label>
+                      {isSlotsLoading && (
+                        <span className="text-[11px] text-purple-600 font-semibold animate-pulse">
+                          Checking availability...
+                        </span>
+                      )}
                     </div>
+
+                    {slotsClosedMessage ? (
+                      <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 text-center font-medium">
+                        {slotsClosedMessage}
+                      </div>
+                    ) : isSlotsLoading ? (
+                      <div className="py-6 text-center text-xs text-slate-400">
+                        Calculating available slots for {bookingService.duration} mins service...
+                      </div>
+                    ) : availableSlots.length === 0 ? (
+                      <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 text-center">
+                        No slots available for this date. Please choose another date.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 max-h-52 overflow-y-auto pr-1">
+                        {availableSlots.map((slot) => (
+                          <button
+                            key={slot}
+                            type="button"
+                            onClick={() => setSelectedSlot(slot)}
+                            className={`py-2 px-2 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
+                              selectedSlot === slot
+                                ? 'bg-purple-600 text-white border-purple-600 shadow-xs'
+                                : 'bg-slate-50 text-slate-700 border-slate-200 hover:border-purple-400 hover:bg-white'
+                            }`}
+                          >
+                            {slot}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   {/* Contact details */}

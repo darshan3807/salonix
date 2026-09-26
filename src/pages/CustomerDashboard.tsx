@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Appointment } from '../types/index.ts';
+import { apiFetch } from '../lib/api.ts';
 import { Calendar, Clock, MapPin, CheckCircle2, XCircle, AlertCircle, Plus, Scissors, UserCheck } from 'lucide-react';
 
 export const CustomerDashboard: React.FC = () => {
@@ -13,7 +14,7 @@ export const CustomerDashboard: React.FC = () => {
     if (!user) return;
     setIsLoading(true);
     try {
-      const res = await fetch(`/api/appointments?userEmail=${encodeURIComponent(user.email)}`);
+      const res = await apiFetch(`/api/appointments?userEmail=${encodeURIComponent(user.email)}`);
       if (res.ok) {
         const data = await res.json();
         setAppointments(data.appointments || []);
@@ -31,9 +32,8 @@ export const CustomerDashboard: React.FC = () => {
 
   const handleCancelAppointment = async (id: string) => {
     try {
-      const res = await fetch(`/api/appointments/${id}/status`, {
+      const res = await apiFetch(`/api/appointments/${id}/status`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: 'cancelled', cancellationReason: 'Cancelled by customer' }),
       });
 
