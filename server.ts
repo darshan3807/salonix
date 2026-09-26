@@ -1,8 +1,27 @@
+import dotenv from 'dotenv';
+import fs from 'fs';
+
+// 1. Load standard .env if present
+dotenv.config();
+
+// 2. Load Cloud Run / AI Studio environment file (/app/.dev.env.json) if present
+try {
+  if (fs.existsSync('/app/.dev.env.json')) {
+    const devEnv = JSON.parse(fs.readFileSync('/app/.dev.env.json', 'utf8'));
+    for (const [key, value] of Object.entries(devEnv)) {
+      if (!process.env[key] && typeof value === 'string') {
+        process.env[key] = value;
+      }
+    }
+  }
+} catch (e) {
+  // Silent catch
+}
+
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import { pool, query, ensureSchema, migratePlaintextPasswords } from './src/db/db.ts';
@@ -15,7 +34,7 @@ import {
   isStatusBlocking,
   intervalsOverlap,
   generateAvailableSlots,
-  BookedInterval,
+  type BookedInterval,
 } from './src/lib/slotUtils.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -26,6 +45,11 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(cors());
 app.use(express.json());
+
+// Health Check Endpoints for Cloud Run / Container Probes
+app.get(['/healthz', '/api/health'], (_req: Request, res: Response) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+});
 
 // API Routes
 
@@ -1160,14 +1184,6 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
   const distPath = path.resolve(__dirname, 'dist');
 
-  // Verify database schema and safely migrate plaintext passwords on startup
-  try {
-    await ensureSchema();
-    await migratePlaintextPasswords();
-  } catch (schemaErr) {
-    console.warn('[DB] Schema/password initialization warning on startup:', schemaErr);
-  }
-
   if (isProd) {
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
@@ -1196,9 +1212,17 @@ async function startServer() {
     }
   }
 
+  // Bind and listen to PORT immediately to satisfy Cloud Run container startup probe
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Salonix Server running on http://0.0.0.0:${PORT} (mode: ${isProd ? 'production' : 'development'})`);
   });
+
+  // Verify database schema and safely migrate plaintext passwords asynchronously in background
+  ensureSchema()
+    .then(() => migratePlaintextPasswords())
+    .catch((schemaErr) => {
+      console.warn('[DB] Schema/password initialization warning on startup:', schemaErr);
+    });
 }
 
 startServer().catch((err) => {

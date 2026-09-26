@@ -1,16 +1,21 @@
 import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 
-// Enforce that JWT_SECRET is strictly provided in process.env.
-// No hardcoded secret, no default secret, no fallback secret.
-const JWT_SECRET = process.env.JWT_SECRET;
-if (!JWT_SECRET || JWT_SECRET.trim() === '') {
-  console.error('\n======================================================');
-  console.error('[FATAL CONFIGURATION ERROR] JWT_SECRET environment variable is missing.');
-  console.error('The server requires process.env.JWT_SECRET to run securely.');
-  console.error('Please configure JWT_SECRET in your environment variables.');
-  console.error('======================================================\n');
-  throw new Error('FATAL CONFIGURATION ERROR: JWT_SECRET environment variable is missing.');
+/**
+ * Enforce that JWT_SECRET is strictly provided in process.env.
+ * No hardcoded secret, no default secret, no fallback secret.
+ */
+export function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret || secret.trim() === '') {
+    console.error('\n======================================================');
+    console.error('[FATAL CONFIGURATION ERROR] JWT_SECRET environment variable is missing.');
+    console.error('The server requires process.env.JWT_SECRET to run securely.');
+    console.error('Please configure JWT_SECRET in your environment variables.');
+    console.error('======================================================\n');
+    throw new Error('FATAL CONFIGURATION ERROR: JWT_SECRET environment variable is missing.');
+  }
+  return secret;
 }
 
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
@@ -36,6 +41,7 @@ declare global {
  * Generate a signed JWT token containing only identity and authorization claims
  */
 export function generateToken(payload: JwtUserPayload): string {
+  const secret = getJwtSecret();
   return jwt.sign(
     {
       id: payload.id,
@@ -44,7 +50,7 @@ export function generateToken(payload: JwtUserPayload): string {
       role: payload.role,
       salonId: payload.salonId || null,
     },
-    JWT_SECRET,
+    secret,
     { expiresIn: JWT_EXPIRES_IN as any }
   );
 }
@@ -62,7 +68,8 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const token = authHeader.split(' ')[1];
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as JwtUserPayload;
+    const secret = getJwtSecret();
+    const decoded = jwt.verify(token, secret) as JwtUserPayload;
     req.user = {
       id: decoded.id,
       uid: decoded.uid,
