@@ -35,10 +35,16 @@ const AppContent: React.FC = () => {
         if (!user) {
           return <LoginPage />;
         }
+        if (user.role !== 'owner' && user.role !== 'admin') {
+          return <CustomerDashboard />;
+        }
         return <SalonOwnerDashboard />;
       case 'admin-dashboard':
         if (!user) {
           return <LoginPage />;
+        }
+        if (user.role !== 'admin') {
+          return user.role === 'owner' ? <SalonOwnerDashboard /> : <CustomerDashboard />;
         }
         return <AdminDashboard />;
       default:

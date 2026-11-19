@@ -6,9 +6,13 @@ import {
 } from 'lucide-react';
 
 export const HomePage: React.FC = () => {
-  const { salons, categories, navigateTo } = useApp();
+  const { salons, categories, navigateTo, navigateToSalonsWithFilters } = useApp();
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCity, setSelectedCity] = useState('All');
+
+  const availableCities = Array.from(
+    new Set(['All', ...salons.map((s) => s.city).filter(Boolean)])
+  );
 
   const filteredSalons = salons.filter((salon) => {
     const matchCity = selectedCity === 'All' || salon.city.toLowerCase() === selectedCity.toLowerCase();
@@ -55,11 +59,13 @@ export const HomePage: React.FC = () => {
                 className="bg-transparent text-sm font-semibold text-slate-800 focus:outline-hidden cursor-pointer"
               >
                 <option value="All">All Cities</option>
-                <option value="Pune">Pune</option>
-                <option value="Mumbai">Mumbai</option>
-                <option value="Nashik">Nashik</option>
-                <option value="Jalgaon">Jalgaon</option>
-                <option value="Navi Mumbai">Navi Mumbai</option>
+                {availableCities
+                  .filter((c) => c !== 'All')
+                  .map((city) => (
+                    <option key={city} value={city}>
+                      {city}
+                    </option>
+                  ))}
               </select>
             </div>
 
@@ -70,6 +76,15 @@ export const HomePage: React.FC = () => {
                 type="text"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    navigateToSalonsWithFilters({
+                      search: searchTerm,
+                      city: selectedCity,
+                      categoryId: 'all',
+                    });
+                  }
+                }}
                 placeholder="Search by salon name or area..."
                 className="w-full text-sm placeholder-slate-400 focus:outline-hidden text-slate-900"
               />
@@ -77,7 +92,13 @@ export const HomePage: React.FC = () => {
 
             {/* Action button */}
             <button
-              onClick={() => navigateTo('salons')}
+              onClick={() =>
+                navigateToSalonsWithFilters({
+                  search: searchTerm,
+                  city: selectedCity,
+                  categoryId: 'all',
+                })
+              }
               className="w-full sm:w-auto px-6 py-3 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white text-sm font-bold shadow-md shadow-purple-600/30 transition-all cursor-pointer whitespace-nowrap"
             >
               Find Salons
@@ -127,7 +148,13 @@ export const HomePage: React.FC = () => {
           {categories.map((cat) => (
             <div
               key={cat.id}
-              onClick={() => navigateTo('salons')}
+              onClick={() =>
+                navigateToSalonsWithFilters({
+                  categoryId: cat.id,
+                  city: 'All',
+                  search: '',
+                })
+              }
               className="p-5 bg-white rounded-2xl border border-slate-200 hover:border-purple-400 hover:shadow-md transition-all cursor-pointer group flex flex-col justify-between h-36"
             >
               <div className="w-10 h-10 rounded-xl bg-purple-50 group-hover:bg-purple-600 text-purple-700 group-hover:text-white flex items-center justify-center transition-colors">
@@ -159,13 +186,13 @@ export const HomePage: React.FC = () => {
             </h2>
           </div>
 
-          {/* Quick city filter pills */}
+          {/* Quick city filter buttons */}
           <div className="flex items-center gap-2 overflow-x-auto pb-2 sm:pb-0">
-            {['All', 'Pune', 'Mumbai', 'Nashik', 'Jalgaon'].map((city) => (
+            {availableCities.map((city) => (
               <button
                 key={city}
                 onClick={() => setSelectedCity(city)}
-                className={`px-3 py-1.5 rounded-full text-xs font-bold transition-all cursor-pointer ${
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer whitespace-nowrap ${
                   selectedCity === city
                     ? 'bg-purple-600 text-white shadow-xs'
                     : 'bg-slate-100 text-slate-600 hover:bg-slate-200'

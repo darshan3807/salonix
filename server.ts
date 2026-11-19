@@ -24,12 +24,13 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
-import { pool, query, ensureSchema, migratePlaintextPasswords } from './src/db/db.ts';
+import { pool, query, getClient, ensureSchema, migratePlaintextPasswords } from './src/db/db.ts';
 import { generateToken, requireAuth, requireRole, requireAdmin, requireSalonOwner, requireCustomer } from './src/middleware/auth.ts';
 import { serializeUser } from './src/lib/userSerializer.ts';
 import {
   timeStringToMinutes,
   minutesToDisplayTime,
+  minutesTo24HTime,
   isSalonOpenOnDate,
   isStatusBlocking,
   intervalsOverlap,
@@ -50,6 +51,39 @@ app.use(express.json());
 app.get(['/healthz', '/api/health'], (_req: Request, res: Response) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
+
+// Helper: Create persistent PostgreSQL notification
+async function createNotification(
+  executor: { query: (text: string, params?: any[]) => Promise<any> },
+  params: {
+    targetRole: 'customer' | 'owner' | 'admin';
+    targetUserId?: string | null;
+    targetSalonId?: string | null;
+    title: string;
+    message: string;
+    type: string;
+    actionRoute?: string;
+  }
+) {
+  const notifId = `notif-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  await executor.query(
+    `INSERT INTO notifications (
+      id, target_role, target_user_id, target_salon_id,
+      title, message, type, read, action_route, created_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, NOW())`,
+    [
+      notifId,
+      params.targetRole,
+      params.targetUserId || null,
+      params.targetSalonId || null,
+      params.title,
+      params.message,
+      params.type,
+      params.actionRoute || null,
+    ]
+  );
+  return notifId;
+}
 
 // API Routes
 
@@ -185,6 +219,109 @@ app.get('/api/auth/me', requireAuth, async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Auth check error:', err);
     return res.status(500).json({ error: 'Internal server error: ' + err.message });
+  }
+});
+
+// 1c. Auth: Update Authenticated User Profile (PATCH /api/auth/profile)
+app.patch('/api/auth/profile', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = req.user!;
+    const { name, phone, city, currentPassword, newPassword } = req.body;
+
+    const userRes = await query('SELECT * FROM users WHERE id = $1', [authUser.id]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'User account not found.' });
+    }
+    const currentUser = userRes.rows[0];
+
+    const updates: Record<string, any> = {};
+
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length < 2) {
+        return res.status(400).json({ error: 'Full name must be at least 2 characters.' });
+      }
+      if (name.trim().length > 100) {
+        return res.status(400).json({ error: 'Full name must not exceed 100 characters.' });
+      }
+      updates.name = name.trim();
+    }
+
+    if (phone !== undefined) {
+      const trimmedPhone = typeof phone === 'string' ? phone.trim() : '';
+      if (trimmedPhone.length > 0 && trimmedPhone.length < 6) {
+        return res.status(400).json({ error: 'Please enter a valid phone number (at least 6 digits).' });
+      }
+      updates.phone = trimmedPhone;
+    }
+
+    if (city !== undefined) {
+      if (typeof city !== 'string' || city.trim().length === 0) {
+        return res.status(400).json({ error: 'City cannot be empty.' });
+      }
+      updates.city = city.trim();
+    }
+
+    // Optional password change with current password verification
+    if (newPassword !== undefined && newPassword !== '') {
+      if (typeof newPassword !== 'string' || newPassword.length < 6) {
+        return res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+      }
+      if (!currentPassword || typeof currentPassword !== 'string') {
+        return res.status(400).json({ error: 'Current password is required to set a new password.' });
+      }
+
+      const isBcrypt =
+        currentUser.password &&
+        (currentUser.password.startsWith('$2a$') ||
+          currentUser.password.startsWith('$2b$') ||
+          currentUser.password.startsWith('$2y$'));
+      const validCurrent = isBcrypt
+        ? await bcrypt.compare(currentPassword, currentUser.password)
+        : currentUser.password === currentPassword;
+
+      if (!validCurrent) {
+        return res.status(400).json({ error: 'Current password is incorrect.' });
+      }
+
+      updates.password = await bcrypt.hash(newPassword, 10);
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid profile fields provided to update.' });
+    }
+
+    const setClauses: string[] = [];
+    const params: any[] = [];
+    Object.entries(updates).forEach(([col, val]) => {
+      params.push(val);
+      setClauses.push(`${col} = $${params.length}`);
+    });
+    params.push(authUser.id);
+
+    const updatedRes = await query(
+      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${params.length}
+       RETURNING id, uid, name, email, phone, role, city, status, salon_id, created_at`,
+      params
+    );
+
+    const updatedUser = updatedRes.rows[0];
+    let salon = null;
+    if (updatedUser.role === 'owner') {
+      const salonRes = await query(
+        'SELECT * FROM salons WHERE owner_id = $1 OR id = $2',
+        [updatedUser.uid, updatedUser.salon_id || '']
+      );
+      if (salonRes.rows.length > 0) salon = salonRes.rows[0];
+    }
+
+    return res.json({
+      success: true,
+      user: serializeUser(updatedUser, salon),
+      message: 'Profile updated successfully.',
+    });
+  } catch (err: any) {
+    console.error('Update profile error:', err);
+    return res.status(500).json({ error: 'Failed to update profile: ' + err.message });
   }
 });
 
@@ -426,6 +563,11 @@ app.post('/api/admin/users/:id/action', requireAuth, requireAdmin, async (req: R
       return res.status(400).json({ error: 'Action must be approve or reject' });
     }
 
+    // Prevent admin from deactivating their own account
+    if (action === 'reject' && String(req.user?.id) === String(id)) {
+      return res.status(400).json({ error: 'You cannot deactivate your own admin account.' });
+    }
+
     const newStatus = action === 'approve' ? 'active' : 'rejected';
 
     const userRes = await query(
@@ -546,31 +688,77 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, async (_req: Request, res
   }
 });
 
-// 8. Public / Customer: Salons List
+// 8. Public / Customer: Salons List (with category filter, sorting & active services summary)
 app.get('/api/salons', async (req: Request, res: Response) => {
   try {
-    const { city, search, all } = req.query;
+    const { city, search, all, categoryId, sort } = req.query;
     let sql = `SELECT * FROM salons WHERE 1=1`;
     const params: any[] = [];
 
-    // Filter to only approved salons unless requested by admin with all=true
+    // Filter to only approved salons unless requested with all=true
     if (all !== 'true') {
       sql += ` AND status = 'approved'`;
     }
 
-    if (city && city !== 'all') {
+    if (city && city !== 'all' && city !== 'All') {
       params.push(city);
       sql += ` AND LOWER(city) = LOWER($${params.length})`;
     }
 
     if (search) {
       params.push(`%${search}%`);
-      sql += ` AND (LOWER(name) LIKE LOWER($${params.length}) OR LOWER(description) LIKE LOWER($${params.length}) OR LOWER(address) LIKE LOWER($${params.length}))`;
+      sql += ` AND (LOWER(name) LIKE LOWER($${params.length}) OR LOWER(description) LIKE LOWER($${params.length}) OR LOWER(address) LIKE LOWER($${params.length}) OR LOWER(city) LIKE LOWER($${params.length}))`;
     }
 
-    sql += ' ORDER BY rating DESC, review_count DESC';
-    const result = await query(sql, params);
-    return res.json({ salons: result.rows });
+    if (categoryId && categoryId !== 'all' && categoryId !== 'All') {
+      params.push(categoryId);
+      sql += ` AND EXISTS (SELECT 1 FROM services sv WHERE sv.salon_id = salons.id AND sv.status = 'active' AND sv.category_id = $${params.length})`;
+    }
+
+    if (sort === 'price_asc') {
+      sql += ' ORDER BY starting_price ASC, rating DESC';
+    } else if (sort === 'price_desc') {
+      sql += ' ORDER BY starting_price DESC, rating DESC';
+    } else {
+      sql += ' ORDER BY rating DESC, review_count DESC';
+    }
+
+    const [salonsResult, servicesResult] = await Promise.all([
+      query(sql, params),
+      query(
+        `SELECT s.id, s.salon_id, s.category_id, s.name, s.description, s.price, s.duration,
+                c.name AS category_name
+         FROM services s
+         LEFT JOIN categories c ON s.category_id = c.id
+         WHERE s.status = 'active'
+         ORDER BY s.price ASC`
+      ),
+    ]);
+
+    const servicesBySalon = new Map<string, any[]>();
+    for (const srv of servicesResult.rows) {
+      const list = servicesBySalon.get(srv.salon_id) || [];
+      list.push(srv);
+      servicesBySalon.set(srv.salon_id, list);
+    }
+
+    const enrichedSalons = salonsResult.rows.map((salon: any) => {
+      const salonServices = servicesBySalon.get(salon.id) || [];
+      const categoryIds = Array.from(new Set(salonServices.map((s) => s.category_id).filter(Boolean)));
+      const minServicePrice = salonServices.length > 0
+        ? Math.min(...salonServices.map((s) => Number(s.price)))
+        : Number(salon.starting_price || 0);
+
+      return {
+        ...salon,
+        services: salonServices,
+        category_ids: categoryIds,
+        service_count: salonServices.length,
+        min_service_price: minServicePrice,
+      };
+    });
+
+    return res.json({ salons: enrichedSalons });
   } catch (err: any) {
     console.error('Salons fetch error:', err);
     return res.status(500).json({ error: err.message });
@@ -602,6 +790,334 @@ app.get('/api/salons/:id', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Salon details error:', err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// 9a. Update Salon Profile & Operating Hours (Owner of that salon or Admin only)
+app.patch('/api/salons/:id', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const authUser = req.user!;
+
+    // 1. Fetch current salon to verify existence and check authorization
+    const salonRes = await query('SELECT * FROM salons WHERE id = $1', [id]);
+    if (salonRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Salon not found.' });
+    }
+    const currentSalon = salonRes.rows[0];
+
+    // 2. Strict authorization: Only assigned owner or Admin
+    if (authUser.role === 'customer') {
+      return res.status(403).json({ error: 'Forbidden. Customers cannot edit salon details.' });
+    }
+
+    if (authUser.role === 'owner') {
+      const isOwner = (authUser.salonId && authUser.salonId === id) || (currentSalon.owner_id === authUser.uid);
+      if (!isOwner) {
+        return res.status(403).json({ error: 'Forbidden. You can only update your own salon.' });
+      }
+    } else if (authUser.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden. Unauthorized access.' });
+    }
+
+    // 3. Extract supported fields - strictly ignore id, owner_id, status, role, rating, review_count
+    const {
+      name,
+      tagline,
+      description,
+      about,
+      address,
+      city,
+      state,
+      pincode,
+      phone,
+      email,
+      openingTime,
+      closingTime,
+      opening_time,
+      closing_time,
+      breakStartTime,
+      breakEndTime,
+      break_start_time,
+      break_end_time,
+      workingDays,
+      working_days,
+      slotDurationMinutes,
+      slot_duration_minutes,
+      startingPrice,
+      starting_price,
+    } = req.body;
+
+    const updates: Record<string, any> = {};
+
+    // Validate name (if provided)
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        return res.status(400).json({ error: 'Salon name cannot be empty.' });
+      }
+      if (name.trim().length > 150) {
+        return res.status(400).json({ error: 'Salon name must not exceed 150 characters.' });
+      }
+      updates.name = name.trim();
+    }
+
+    // Validate tagline, description, about
+    if (tagline !== undefined) {
+      updates.tagline = typeof tagline === 'string' ? tagline.trim() : null;
+    }
+    if (description !== undefined) {
+      updates.description = typeof description === 'string' ? description.trim() : null;
+    }
+    if (about !== undefined) {
+      updates.about = typeof about === 'string' ? about.trim() : null;
+    }
+
+    // Validate address & location
+    if (address !== undefined) {
+      if (typeof address !== 'string' || address.trim().length === 0) {
+        return res.status(400).json({ error: 'Salon address cannot be empty.' });
+      }
+      updates.address = address.trim();
+    }
+    if (city !== undefined) {
+      if (typeof city !== 'string' || city.trim().length === 0) {
+        return res.status(400).json({ error: 'City cannot be empty.' });
+      }
+      updates.city = city.trim();
+    }
+    if (state !== undefined) {
+      updates.state = typeof state === 'string' ? state.trim() : null;
+    }
+    if (pincode !== undefined) {
+      updates.pincode = typeof pincode === 'string' ? pincode.trim() : null;
+    }
+
+    // Validate contact info
+    if (phone !== undefined) {
+      if (typeof phone !== 'string' || phone.trim().length < 6) {
+        return res.status(400).json({ error: 'Please provide a valid phone number (at least 6 characters).' });
+      }
+      updates.phone = phone.trim();
+    }
+    if (email !== undefined) {
+      if (typeof email !== 'string' || !email.includes('@')) {
+        return res.status(400).json({ error: 'Please provide a valid email address.' });
+      }
+      updates.email = email.trim();
+    }
+
+    // Validate starting price
+    const finalStartingPrice = startingPrice !== undefined ? startingPrice : starting_price;
+    if (finalStartingPrice !== undefined) {
+      const priceNum = Number(finalStartingPrice);
+      if (isNaN(priceNum) || priceNum < 0) {
+        return res.status(400).json({ error: 'Starting price must be a non-negative number.' });
+      }
+      updates.starting_price = Math.round(priceNum);
+    }
+
+    // Validate slot duration
+    const finalSlotDuration = slotDurationMinutes !== undefined ? slotDurationMinutes : slot_duration_minutes;
+    if (finalSlotDuration !== undefined) {
+      const durationNum = Number(finalSlotDuration);
+      if (isNaN(durationNum) || durationNum < 10 || durationNum > 240) {
+        return res.status(400).json({ error: 'Slot duration must be between 10 and 240 minutes.' });
+      }
+      updates.slot_duration_minutes = Math.round(durationNum);
+    }
+
+    // Operating hours calculation & validation
+    const candidateOpeningStr = openingTime !== undefined ? openingTime : (opening_time !== undefined ? opening_time : currentSalon.opening_time);
+    const candidateClosingStr = closingTime !== undefined ? closingTime : (closing_time !== undefined ? closing_time : currentSalon.closing_time);
+
+    const openMin = timeStringToMinutes(candidateOpeningStr);
+    const closeMin = timeStringToMinutes(candidateClosingStr);
+
+    if (openMin === null) {
+      return res.status(400).json({ error: 'Invalid opening time format. Expected 24h (e.g. "09:00") or 12h (e.g. "09:00 AM").' });
+    }
+    if (closeMin === null) {
+      return res.status(400).json({ error: 'Invalid closing time format. Expected 24h (e.g. "20:00") or 12h (e.g. "08:00 PM").' });
+    }
+    if (openMin >= closeMin) {
+      return res.status(400).json({ error: 'Opening time must be earlier than closing time.' });
+    }
+    if (closeMin - openMin < 60) {
+      return res.status(400).json({ error: 'Salon must be open for at least 1 hour (60 minutes) daily.' });
+    }
+
+    if (openingTime !== undefined || opening_time !== undefined) {
+      updates.opening_time = minutesTo24HTime(openMin);
+    }
+    if (closingTime !== undefined || closing_time !== undefined) {
+      updates.closing_time = minutesTo24HTime(closeMin);
+    }
+
+    // Break hours calculation & validation
+    const candidateBreakStartStr = breakStartTime !== undefined ? breakStartTime : (break_start_time !== undefined ? break_start_time : currentSalon.break_start_time);
+    const candidateBreakEndStr = breakEndTime !== undefined ? breakEndTime : (break_end_time !== undefined ? break_end_time : currentSalon.break_end_time);
+
+    const hasCandidateBreakStart = candidateBreakStartStr !== undefined && candidateBreakStartStr !== null && String(candidateBreakStartStr).trim() !== '';
+    const hasCandidateBreakEnd = candidateBreakEndStr !== undefined && candidateBreakEndStr !== null && String(candidateBreakEndStr).trim() !== '';
+
+    if (hasCandidateBreakStart || hasCandidateBreakEnd) {
+      if (!hasCandidateBreakStart || !hasCandidateBreakEnd) {
+        return res.status(400).json({ error: 'Both break start time and break end time must be specified together.' });
+      }
+
+      const breakStartMin = timeStringToMinutes(candidateBreakStartStr);
+      const breakEndMin = timeStringToMinutes(candidateBreakEndStr);
+
+      if (breakStartMin === null || breakEndMin === null) {
+        return res.status(400).json({ error: 'Invalid break time format. Expected 24h (e.g. "13:30") or 12h (e.g. "01:30 PM").' });
+      }
+      if (breakStartMin >= breakEndMin) {
+        return res.status(400).json({ error: 'Break start time must be earlier than break end time.' });
+      }
+      if (breakStartMin < openMin || breakEndMin > closeMin) {
+        return res.status(400).json({
+          error: `Break hours (${minutesToDisplayTime(breakStartMin)} - ${minutesToDisplayTime(breakEndMin)}) must fit entirely within operating hours (${minutesToDisplayTime(openMin)} - ${minutesToDisplayTime(closeMin)}).`
+        });
+      }
+
+      updates.break_start_time = minutesTo24HTime(breakStartMin);
+      updates.break_end_time = minutesTo24HTime(breakEndMin);
+    } else if (
+      (breakStartTime === '' || breakStartTime === null || break_start_time === '' || break_start_time === null) &&
+      (breakEndTime === '' || breakEndTime === null || break_end_time === '' || break_end_time === null)
+    ) {
+      // Owner explicitly cleared break
+      updates.break_start_time = null;
+      updates.break_end_time = null;
+    }
+
+    // Working days validation
+    const candidateWorkingDays = workingDays !== undefined ? workingDays : working_days;
+    if (candidateWorkingDays !== undefined) {
+      const VALID_DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      let daysArray: string[] = [];
+
+      if (Array.isArray(candidateWorkingDays)) {
+        daysArray = candidateWorkingDays;
+      } else if (typeof candidateWorkingDays === 'string') {
+        const trimmed = candidateWorkingDays.trim();
+        if (trimmed.startsWith('[')) {
+          try {
+            daysArray = JSON.parse(trimmed);
+          } catch {
+            return res.status(400).json({ error: 'Invalid working_days JSON format.' });
+          }
+        } else {
+          daysArray = trimmed.split(',').map((s) => s.trim()).filter(Boolean);
+        }
+      } else {
+        return res.status(400).json({ error: 'working_days must be an array of days or comma-separated string.' });
+      }
+
+      if (!Array.isArray(daysArray) || daysArray.length === 0) {
+        return res.status(400).json({ error: 'Salon must have at least one working day selected.' });
+      }
+
+      for (const d of daysArray) {
+        if (!VALID_DAYS.includes(d)) {
+          return res.status(400).json({
+            error: `Invalid working day: "${d}". Allowed values are: ${VALID_DAYS.join(', ')}.`
+          });
+        }
+      }
+
+      // Store in standard JSON string format matching existing database rows: '["Mon","Tue",...]'
+      updates.working_days = JSON.stringify(daysArray);
+    }
+
+    // Safety verification: Check whether shrinking operating hours would conflict with upcoming confirmed bookings
+    const scheduleChanged =
+      updates.opening_time !== undefined ||
+      updates.closing_time !== undefined ||
+      updates.break_start_time !== undefined ||
+      updates.break_end_time !== undefined ||
+      updates.working_days !== undefined;
+
+    if (scheduleChanged) {
+      const today = new Date().toISOString().slice(0, 10);
+      const upcomingAptsRes = await query(
+        `SELECT id, date, start_time, end_time, duration_minutes, customer_name, status
+         FROM appointments
+         WHERE salon_id = $1 AND status IN ('confirmed', 'pending') AND date >= $2`,
+        [id, today]
+      );
+
+      const effectiveWorkingDays = updates.working_days !== undefined ? updates.working_days : currentSalon.working_days;
+      const effectiveOpenMin = updates.opening_time !== undefined ? timeStringToMinutes(updates.opening_time)! : openMin;
+      const effectiveCloseMin = updates.closing_time !== undefined ? timeStringToMinutes(updates.closing_time)! : closeMin;
+      const effectiveBreakStart = updates.break_start_time !== undefined ? (updates.break_start_time ? timeStringToMinutes(updates.break_start_time) : null) : (currentSalon.break_start_time ? timeStringToMinutes(currentSalon.break_start_time) : null);
+      const effectiveBreakEnd = updates.break_end_time !== undefined ? (updates.break_end_time ? timeStringToMinutes(updates.break_end_time) : null) : (currentSalon.break_end_time ? timeStringToMinutes(currentSalon.break_end_time) : null);
+
+      for (const apt of upcomingAptsRes.rows) {
+        // 1. Check if salon would now be closed on this appointment's date
+        if (!isSalonOpenOnDate(effectiveWorkingDays, apt.date)) {
+          return res.status(409).json({
+            error: 'Schedule change conflict',
+            message: `Cannot remove working day because there is an upcoming confirmed appointment on ${apt.date} for ${apt.customer_name}. Please reschedule or resolve existing bookings first.`
+          });
+        }
+
+        const aptStart = timeStringToMinutes(apt.start_time);
+        const aptEnd = timeStringToMinutes(apt.end_time) || (aptStart !== null ? aptStart + (Number(apt.duration_minutes) || 30) : null);
+
+        if (aptStart !== null && aptEnd !== null) {
+          // 2. Check if hours cut off existing appointment
+          if (aptStart < effectiveOpenMin || aptEnd > effectiveCloseMin) {
+            return res.status(409).json({
+              error: 'Schedule change conflict',
+              message: `New operating hours (${minutesToDisplayTime(effectiveOpenMin)} - ${minutesToDisplayTime(effectiveCloseMin)}) conflict with an upcoming confirmed appointment on ${apt.date} at ${apt.start_time} for ${apt.customer_name}. Please adjust the hours or resolve existing bookings first.`
+            });
+          }
+
+          // 3. Check if new break hours overlap existing appointment
+          if (effectiveBreakStart !== null && effectiveBreakEnd !== null && effectiveBreakStart < effectiveBreakEnd) {
+            if (intervalsOverlap(aptStart, aptEnd, effectiveBreakStart, effectiveBreakEnd)) {
+              return res.status(409).json({
+                error: 'Schedule change conflict',
+                message: `New break hours (${minutesToDisplayTime(effectiveBreakStart)} - ${minutesToDisplayTime(effectiveBreakEnd)}) overlap an upcoming confirmed appointment on ${apt.date} at ${apt.start_time} for ${apt.customer_name}.`
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No valid fields provided for update.' });
+    }
+
+    // Build parameterized UPDATE query dynamically
+    const setClauses: string[] = [];
+    const queryParams: any[] = [];
+
+    Object.entries(updates).forEach(([col, val]) => {
+      queryParams.push(val);
+      setClauses.push(`${col} = $${queryParams.length}`);
+    });
+
+    queryParams.push(id);
+    const updateSql = `
+      UPDATE salons
+      SET ${setClauses.join(', ')}
+      WHERE id = $${queryParams.length}
+      RETURNING *
+    `;
+
+    const updateRes = await query(updateSql, queryParams);
+
+    return res.json({
+      success: true,
+      salon: updateRes.rows[0],
+      message: 'Salon details updated successfully!',
+    });
+  } catch (err: any) {
+    console.error('Update salon error:', err);
+    return res.status(500).json({ error: 'Failed to update salon: ' + err.message });
   }
 });
 
@@ -736,6 +1252,170 @@ app.get('/api/categories', async (_req: Request, res: Response) => {
   }
 });
 
+// 10a. Admin: Create Category
+app.post('/api/admin/categories', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { name, description = '', iconName = 'Scissors' } = req.body;
+    if (!name || typeof name !== 'string' || name.trim().length < 2) {
+      return res.status(400).json({ error: 'Category name must be at least 2 characters.' });
+    }
+
+    const slug = name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+    const catId = `cat-${slug || Date.now()}-${Date.now().toString().slice(-4)}`;
+
+    const result = await query(
+      `INSERT INTO categories (id, name, description, icon_name)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [catId, name.trim(), typeof description === 'string' ? description.trim() : '', iconName]
+    );
+
+    return res.status(201).json({
+      success: true,
+      category: result.rows[0],
+      message: `Category "${name.trim()}" created successfully.`,
+    });
+  } catch (err: any) {
+    console.error('Create category error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 10b. Admin: Delete Category
+app.delete('/api/admin/categories/:id', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const inUseRes = await query('SELECT COUNT(*) FROM services WHERE category_id = $1', [id]);
+    const count = parseInt(inUseRes.rows[0]?.count || '0', 10);
+    if (count > 0) {
+      return res.status(409).json({
+        error: `Cannot delete this category because ${count} salon service(s) currently use it.`,
+      });
+    }
+
+    const delRes = await query('DELETE FROM categories WHERE id = $1 RETURNING *', [id]);
+    if (delRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+
+    return res.json({
+      success: true,
+      message: 'Category deleted successfully.',
+    });
+  } catch (err: any) {
+    console.error('Delete category error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 10c. Notifications: Get Authenticated User's Scoped Notifications
+app.get('/api/notifications', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = req.user!;
+    let sql = '';
+    let params: any[] = [];
+
+    if (authUser.role === 'customer') {
+      sql = `SELECT * FROM notifications WHERE target_user_id = $1 ORDER BY created_at DESC LIMIT 50`;
+      params = [authUser.uid];
+    } else if (authUser.role === 'owner') {
+      sql = `SELECT * FROM notifications
+             WHERE target_user_id = $1
+                OR (target_role = 'owner' AND target_salon_id IS NOT NULL AND target_salon_id = $2)
+             ORDER BY created_at DESC LIMIT 50`;
+      params = [authUser.uid, authUser.salonId || ''];
+    } else if (authUser.role === 'admin') {
+      sql = `SELECT * FROM notifications
+             WHERE target_role = 'admin' OR target_user_id = $1
+             ORDER BY created_at DESC LIMIT 50`;
+      params = [authUser.uid];
+    } else {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+
+    const result = await query(sql, params);
+    const unreadCount = result.rows.filter((n: any) => !n.read).length;
+
+    return res.json({
+      notifications: result.rows,
+      unreadCount,
+    });
+  } catch (err: any) {
+    console.error('Fetch notifications error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 10d. Notifications: Mark All as Read for Authenticated User
+app.patch('/api/notifications/read-all', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = req.user!;
+    if (authUser.role === 'customer') {
+      await query(`UPDATE notifications SET read = true WHERE target_user_id = $1 AND read = false`, [authUser.uid]);
+    } else if (authUser.role === 'owner') {
+      await query(
+        `UPDATE notifications SET read = true
+         WHERE (target_user_id = $1 OR (target_role = 'owner' AND target_salon_id IS NOT NULL AND target_salon_id = $2))
+           AND read = false`,
+        [authUser.uid, authUser.salonId || '']
+      );
+    } else if (authUser.role === 'admin') {
+      await query(
+        `UPDATE notifications SET read = true
+         WHERE (target_role = 'admin' OR target_user_id = $1) AND read = false`,
+        [authUser.uid]
+      );
+    }
+
+    return res.json({ success: true, message: 'All notifications marked as read.' });
+  } catch (err: any) {
+    console.error('Mark all notifications read error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 10e. Notifications: Mark Single Notification as Read (Ownership Enforced)
+app.patch('/api/notifications/:id/read', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = req.user!;
+    const { id } = req.params;
+
+    const notifRes = await query('SELECT * FROM notifications WHERE id = $1', [id]);
+    if (notifRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found.' });
+    }
+    const notif = notifRes.rows[0];
+
+    const isAllowed =
+      (authUser.role === 'customer' && notif.target_user_id === authUser.uid) ||
+      (authUser.role === 'owner' &&
+        (notif.target_user_id === authUser.uid ||
+          (notif.target_role === 'owner' && authUser.salonId && notif.target_salon_id === authUser.salonId))) ||
+      (authUser.role === 'admin' && (notif.target_role === 'admin' || notif.target_user_id === authUser.uid));
+
+    if (!isAllowed) {
+      return res.status(403).json({ error: 'Forbidden. You cannot update this notification.' });
+    }
+
+    const updated = await query(
+      'UPDATE notifications SET read = true WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    return res.json({
+      success: true,
+      notification: updated.rows[0],
+    });
+  } catch (err: any) {
+    console.error('Mark notification read error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // 11. Appointments: Get list (Protected: scoped by role & ownership)
 app.get('/api/appointments', requireAuth, async (req: Request, res: Response) => {
   try {
@@ -782,7 +1462,7 @@ app.get('/api/appointments', requireAuth, async (req: Request, res: Response) =>
 
 // 12. Appointments: Create (Book slot - strictly server-validated, transaction-safe)
 app.post('/api/appointments', requireAuth, async (req: Request, res: Response) => {
-  const client = await pool.connect();
+  const client = await getClient();
   try {
     const authUser = req.user!;
     const {
@@ -926,7 +1606,7 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
       }
     }
 
-    // 12. Insert the appointment with server-calculated fields
+    // 12. Insert the appointment with server-calculated fields (starts as pending for owner review)
     const appointmentId = `apt-${Date.now()}`;
     const calculatedStartTime = minutesToDisplayTime(startMinutes);
     const calculatedEndTime = minutesToDisplayTime(endMinutes);
@@ -941,7 +1621,7 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
         $1, $2, $3, $4, $5,
         $6, $7, $8, $9,
         $10, $11, $12, $13, $14,
-        $15, $16, 'confirmed', $17, NOW()
+        $15, $16, 'pending', $17, NOW()
       ) RETURNING *`,
       [
         appointmentId,
@@ -964,13 +1644,34 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
       ]
     );
 
+    // 12b. Create real notifications for both Salon Owner and Customer inside transaction
+    await createNotification(client, {
+      targetRole: 'owner',
+      targetUserId: salon.owner_id || null,
+      targetSalonId: salon.id,
+      title: 'New Booking Request',
+      message: `${customerName.trim()} requested ${canonicalServiceName} on ${date} at ${calculatedStartTime}. Review to accept or reject.`,
+      type: 'booking_created',
+      actionRoute: 'owner-dashboard',
+    });
+
+    await createNotification(client, {
+      targetRole: 'customer',
+      targetUserId: bookingCustomerId,
+      targetSalonId: salon.id,
+      title: 'Booking Request Submitted',
+      message: `Your request for ${canonicalServiceName} at ${salon.name} on ${date} at ${calculatedStartTime} is pending salon approval.`,
+      type: 'booking_created',
+      actionRoute: 'customer-dashboard',
+    });
+
     // 13. Commit transaction
     await client.query('COMMIT');
 
     return res.status(201).json({
       success: true,
       appointment: insertRes.rows[0],
-      message: 'Appointment booked successfully!',
+      message: 'Appointment request submitted! Awaiting salon confirmation.',
     });
   } catch (err: any) {
     try {
@@ -983,20 +1684,28 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
   }
 });
 
-// 13. Appointments: Update Status (Accept / Complete / Cancel - strictly authorized)
+// 13. Appointments: Update Status (Accept / Reject / Complete / Cancel - strictly authorized & validated)
 app.patch('/api/appointments/:id/status', requireAuth, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { status, cancellationReason } = req.body;
+    const { status, cancellationReason, rejectionReason, reason } = req.body;
     const authUser = req.user!;
 
-    // First fetch the appointment to check authorization
+    const ALLOWED_STATUSES = ['confirmed', 'rejected', 'completed', 'cancelled'];
+    if (!status || typeof status !== 'string' || !ALLOWED_STATUSES.includes(status)) {
+      return res.status(400).json({
+        error: `Invalid status. Allowed values are: ${ALLOWED_STATUSES.join(', ')}.`,
+      });
+    }
+
+    // First fetch the appointment to check authorization & current status
     const aptRes = await query('SELECT * FROM appointments WHERE id = $1', [id]);
     if (aptRes.rows.length === 0) {
       return res.status(404).json({ error: 'Appointment not found' });
     }
 
     const apt = aptRes.rows[0];
+    const currentStatus = String(apt.status || '').toLowerCase();
 
     // Verify permission:
     // Admin: can update any appointment
@@ -1009,7 +1718,9 @@ app.patch('/api/appointments/:id/status', requireAuth, async (req: Request, res:
         return res.status(403).json({ error: 'Forbidden. You can only update appointments for your own salon.' });
       }
     } else if (authUser.role === 'customer') {
-      const isOwner = apt.customer_id === authUser.uid || (apt.customer_email && apt.customer_email.toLowerCase() === authUser.email.toLowerCase());
+      const isOwner =
+        apt.customer_id === authUser.uid ||
+        (apt.customer_email && apt.customer_email.toLowerCase() === authUser.email.toLowerCase());
       if (!isOwner) {
         return res.status(403).json({ error: 'Forbidden. You can only modify your own appointments.' });
       }
@@ -1020,17 +1731,106 @@ app.patch('/api/appointments/:id/status', requireAuth, async (req: Request, res:
       return res.status(403).json({ error: 'Access denied.' });
     }
 
+    // Enforce valid state transitions
+    const VALID_TRANSITIONS: Record<string, string[]> = {
+      pending: ['confirmed', 'rejected', 'cancelled'],
+      confirmed: ['completed', 'cancelled'],
+    };
+    const allowedNext = VALID_TRANSITIONS[currentStatus] || [];
+    if (!allowedNext.includes(status)) {
+      return res.status(400).json({
+        error: `Cannot change appointment status from "${currentStatus}" to "${status}".`,
+      });
+    }
+
+    const finalRejectionReason =
+      status === 'rejected'
+        ? (rejectionReason || reason || 'Declined by salon owner').toString().trim()
+        : apt.rejection_reason || null;
+
+    const finalCancellationReason =
+      status === 'cancelled'
+        ? (
+            cancellationReason ||
+            reason ||
+            (authUser.role === 'customer' ? 'Cancelled by customer' : 'Cancelled by salon')
+          )
+            .toString()
+            .trim()
+        : apt.cancellation_reason || null;
+
     const result = await query(
       `UPDATE appointments
-       SET status = $1, cancellation_reason = $2
-       WHERE id = $3
+       SET status = $1, rejection_reason = $2, cancellation_reason = $3
+       WHERE id = $4
        RETURNING *`,
-      [status, cancellationReason || null, id]
+      [status, finalRejectionReason, finalCancellationReason, id]
     );
+
+    const updatedApt = result.rows[0];
+
+    // Emit real counterparty notification
+    try {
+      if (status === 'confirmed') {
+        await createNotification({ query }, {
+          targetRole: 'customer',
+          targetUserId: apt.customer_id,
+          targetSalonId: apt.salon_id,
+          title: 'Appointment Confirmed',
+          message: `${apt.salon_name} confirmed your ${apt.service_name} booking for ${apt.date} at ${apt.start_time}.`,
+          type: 'booking_confirmed',
+          actionRoute: 'customer-dashboard',
+        });
+      } else if (status === 'rejected') {
+        await createNotification({ query }, {
+          targetRole: 'customer',
+          targetUserId: apt.customer_id,
+          targetSalonId: apt.salon_id,
+          title: 'Appointment Rejected',
+          message: `${apt.salon_name} could not accept your ${apt.service_name} booking on ${apt.date} at ${apt.start_time}. Reason: ${finalRejectionReason}`,
+          type: 'booking_rejected',
+          actionRoute: 'customer-dashboard',
+        });
+      } else if (status === 'completed') {
+        await createNotification({ query }, {
+          targetRole: 'customer',
+          targetUserId: apt.customer_id,
+          targetSalonId: apt.salon_id,
+          title: 'Appointment Completed',
+          message: `Your ${apt.service_name} appointment at ${apt.salon_name} (${apt.date}) has been marked completed. Thank you for visiting!`,
+          type: 'booking_completed',
+          actionRoute: 'customer-dashboard',
+        });
+      } else if (status === 'cancelled') {
+        if (authUser.role === 'customer') {
+          await createNotification({ query }, {
+            targetRole: 'owner',
+            targetUserId: null,
+            targetSalonId: apt.salon_id,
+            title: 'Booking Cancelled by Customer',
+            message: `${apt.customer_name} cancelled their ${apt.service_name} appointment on ${apt.date} at ${apt.start_time}. The slot is now available again.`,
+            type: 'booking_cancelled',
+            actionRoute: 'owner-dashboard',
+          });
+        } else {
+          await createNotification({ query }, {
+            targetRole: 'customer',
+            targetUserId: apt.customer_id,
+            targetSalonId: apt.salon_id,
+            title: 'Appointment Cancelled by Salon',
+            message: `${apt.salon_name} cancelled your ${apt.service_name} appointment on ${apt.date} at ${apt.start_time}. Reason: ${finalCancellationReason}`,
+            type: 'booking_cancelled',
+            actionRoute: 'customer-dashboard',
+          });
+        }
+      }
+    } catch (notifErr) {
+      console.warn('Notification insert warning:', notifErr);
+    }
 
     return res.json({
       success: true,
-      appointment: result.rows[0]
+      appointment: updatedApt,
     });
   } catch (err: any) {
     console.error('Update appointment status error:', err);
@@ -1063,8 +1863,18 @@ app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
       targetSalonId = authUser.salonId;
     }
 
-    if (!targetSalonId || !name || price === undefined || price === null || price === '') {
+    if (!targetSalonId || !name || typeof name !== 'string' || !name.trim() || price === undefined || price === null || price === '') {
       return res.status(400).json({ error: 'Salon ID, service name, and price are required' });
+    }
+
+    const parsedPrice = Number(price);
+    const parsedDuration = duration !== undefined && duration !== '' ? Number(duration) : 30;
+
+    if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+      return res.status(400).json({ error: 'Service price must be a non-negative number.' });
+    }
+    if (!Number.isFinite(parsedDuration) || parsedDuration < 5 || parsedDuration > 480) {
+      return res.status(400).json({ error: 'Service duration must be between 5 and 480 minutes.' });
     }
 
     const srvId = `srv-${Date.now()}`;
@@ -1078,8 +1888,8 @@ app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
         categoryId || 'cat-hair',
         name.trim(),
         description || '',
-        Number(price),
-        Number(duration) || 30,
+        Math.round(parsedPrice),
+        Math.round(parsedDuration),
       ]
     );
 
@@ -1119,19 +1929,30 @@ app.patch('/api/services/:id', requireAuth, async (req: Request, res: Response) 
       }
     }
 
+    if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
+      return res.status(400).json({ error: 'Service name cannot be empty.' });
+    }
+
     const updatedName = name !== undefined ? name.trim() : service.name;
     const updatedDesc = description !== undefined ? description : service.description;
-    const updatedPrice = price !== undefined ? Number(price) : service.price;
-    const updatedDuration = duration !== undefined ? Number(duration) : service.duration;
+    const updatedPrice = price !== undefined ? Number(price) : Number(service.price);
+    const updatedDuration = duration !== undefined ? Number(duration) : Number(service.duration);
     const updatedCat = categoryId !== undefined ? categoryId : service.category_id;
     const updatedStatus = status !== undefined ? status : service.status;
+
+    if (!Number.isFinite(updatedPrice) || updatedPrice < 0) {
+      return res.status(400).json({ error: 'Service price must be a non-negative number.' });
+    }
+    if (!Number.isFinite(updatedDuration) || updatedDuration < 5 || updatedDuration > 480) {
+      return res.status(400).json({ error: 'Service duration must be between 5 and 480 minutes.' });
+    }
 
     const result = await query(
       `UPDATE services
        SET name = $1, description = $2, price = $3, duration = $4, category_id = $5, status = $6
        WHERE id = $7
        RETURNING *`,
-      [updatedName, updatedDesc, updatedPrice, updatedDuration, updatedCat, updatedStatus, id]
+      [updatedName, updatedDesc, Math.round(updatedPrice), Math.round(updatedDuration), updatedCat, updatedStatus, id]
     );
 
     return res.json({

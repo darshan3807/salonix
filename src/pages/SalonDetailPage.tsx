@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 
 export const SalonDetailPage: React.FC = () => {
-  const { selectedSalonId, user, navigateTo } = useApp();
+  const { selectedSalonId, user, navigateTo, refreshNotifications } = useApp();
   const [salon, setSalon] = useState<Salon | null>(null);
   const [services, setServices] = useState<Service[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -140,6 +140,7 @@ export const SalonDetailPage: React.FC = () => {
 
       if (res.ok && data.success) {
         setBookingSuccess(data.appointment);
+        refreshNotifications();
       } else {
         setErrorMsg(data.error || data.message || 'Booking failed');
       }
@@ -208,17 +209,29 @@ export const SalonDetailPage: React.FC = () => {
               <MapPin className="w-3.5 h-3.5 text-purple-400" />
               <span>{salon.address}, {salon.city}</span>
             </span>
-            <span className="flex items-center gap-1">
+            <span className="flex items-center gap-1 tabular-nums">
               <Clock className="w-3.5 h-3.5 text-purple-400" />
               <span>{salon.opening_time || '09:00 AM'} - {salon.closing_time || '08:00 PM'}</span>
             </span>
+            {salon.phone && (
+              <span className="flex items-center gap-1 tabular-nums">
+                <Phone className="w-3.5 h-3.5 text-purple-400" />
+                <span>{salon.phone}</span>
+              </span>
+            )}
+            {salon.break_start_time && salon.break_end_time && (
+              <span className="flex items-center gap-1 text-purple-200 tabular-nums">
+                <Calendar className="w-3.5 h-3.5 text-purple-400" />
+                <span>Break: {salon.break_start_time} – {salon.break_end_time}</span>
+              </span>
+            )}
           </div>
         </div>
 
         <div className="bg-white/10 backdrop-blur-md p-5 rounded-2xl border border-white/20 text-center w-full md:w-auto">
           <span className="text-xs uppercase font-bold text-slate-300 block">Services Starting At</span>
-          <span className="text-3xl font-serif font-bold text-purple-300">₹{salon.starting_price || 250}</span>
-          <span className="text-[11px] text-slate-400 block mt-1">Instant Slot Booking</span>
+          <span className="text-3xl font-serif font-bold text-purple-300 tabular-nums">₹{salon.starting_price || 250}</span>
+          <span className="text-[11px] text-slate-300 block mt-1">Real-Time Slot Availability</span>
         </div>
       </div>
 
@@ -278,26 +291,35 @@ export const SalonDetailPage: React.FC = () => {
             
             {bookingSuccess ? (
               <div className="text-center space-y-5 py-4">
-                <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto">
-                  <CheckCircle2 className="w-8 h-8" />
+                <div className="w-16 h-16 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center mx-auto">
+                  <Clock className="w-8 h-8" />
                 </div>
-                <div className="space-y-1">
+                <div className="space-y-1.5">
+                  <span className="inline-block px-3 py-1 rounded-md text-[11px] font-bold uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-200">
+                    Pending Salon Approval
+                  </span>
                   <h3 className="text-2xl font-serif font-bold text-slate-900">
-                    Appointment Confirmed!
+                    Booking Request Submitted!
                   </h3>
-                  <p className="text-xs text-slate-500">
-                    Your slot at <strong className="text-slate-800">{salon.name}</strong> is reserved.
+                  <p className="text-xs text-slate-500 max-w-sm mx-auto">
+                    Your slot at <strong className="text-slate-800">{salon.name}</strong> is reserved while the salon owner reviews and confirms your booking. You will receive a notification once accepted.
                   </p>
                 </div>
 
-                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 text-xs text-left space-y-2">
+                <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 text-xs text-left space-y-2 tabular-nums">
                   <div className="flex justify-between">
                     <span className="text-slate-500">Service:</span>
                     <span className="font-bold text-slate-900">{bookingSuccess.service_name}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Date & Slot:</span>
-                    <span className="font-bold text-purple-700">{bookingSuccess.date} at {bookingSuccess.start_time}</span>
+                    <span className="font-bold text-purple-700">
+                      {bookingSuccess.date} at {bookingSuccess.start_time}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">Status:</span>
+                    <span className="font-bold uppercase text-amber-700">{bookingSuccess.status}</span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Estimated Price:</span>
@@ -305,7 +327,9 @@ export const SalonDetailPage: React.FC = () => {
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Client:</span>
-                    <span className="text-slate-900">{bookingSuccess.customer_name} ({bookingSuccess.customer_phone})</span>
+                    <span className="text-slate-900">
+                      {bookingSuccess.customer_name} ({bookingSuccess.customer_phone})
+                    </span>
                   </div>
                 </div>
 
@@ -322,7 +346,7 @@ export const SalonDetailPage: React.FC = () => {
                     }}
                     className="flex-1 py-3 rounded-xl text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 transition-colors cursor-pointer"
                   >
-                    {user?.role === 'customer' ? 'View in My Appointments' : 'Done'}
+                    {user?.role === 'customer' ? 'Track in My Appointments' : 'Done'}
                   </button>
                 </div>
               </div>
@@ -456,17 +480,35 @@ export const SalonDetailPage: React.FC = () => {
                   </div>
 
                   <div className="pt-2">
-                    <button
-                      type="submit"
-                      disabled={isSubmitting}
-                      className="w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 transition-all shadow-md shadow-purple-600/25 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                    >
-                      {isSubmitting ? (
-                        <span>Reserving slot...</span>
-                      ) : (
-                        <span>Confirm Appointment Reservation</span>
-                      )}
-                    </button>
+                    {!user ? (
+                      <div className="p-3.5 bg-purple-50 border border-purple-200 rounded-xl text-center space-y-2.5">
+                        <p className="text-xs font-medium text-purple-900">
+                          Please sign in to submit your appointment request and receive confirmation alerts.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBookingService(null);
+                            navigateTo('login');
+                          }}
+                          className="w-full py-2.5 px-4 rounded-xl text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 transition-colors cursor-pointer"
+                        >
+                          Log In to Book Appointment
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="submit"
+                        disabled={isSubmitting || !selectedSlot}
+                        className="w-full py-3 px-4 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 transition-all shadow-md shadow-purple-600/25 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                      >
+                        {isSubmitting ? (
+                          <span>Submitting Request...</span>
+                        ) : (
+                          <span>Submit Booking Request</span>
+                        )}
+                      </button>
+                    )}
                   </div>
                 </form>
               </>

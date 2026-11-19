@@ -37,6 +37,10 @@ export interface Salon {
   openingTime?: string;
   closing_time?: string;
   closingTime?: string;
+  break_start_time?: string;
+  breakStartTime?: string;
+  break_end_time?: string;
+  breakEndTime?: string;
   slot_duration_minutes?: number;
   slotDurationMinutes?: number;
   working_days?: string | string[];
@@ -50,6 +54,10 @@ export interface Salon {
   status: 'pending' | 'approved' | 'rejected';
   accent_color?: string;
   accentColor?: string;
+  services?: Service[];
+  category_ids?: string[];
+  service_count?: number;
+  min_service_price?: number;
   created_at?: string;
   createdAt?: string;
 }
