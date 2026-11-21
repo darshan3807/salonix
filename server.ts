@@ -403,7 +403,25 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
     await client.query('BEGIN');
     inTransaction = true;
 
-    // If salon owner, create salon entry with pending status + 3 starter services atomically
+    // 1. Insert user FIRST with salon_id = NULL so fk_salons_owner (salons.owner_id -> users.uid) is always satisfied
+    await client.query(
+      `INSERT INTO users (
+        uid, email, name, phone, role, city, status, salon_id, password, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
+      [
+        newUid,
+        normalizedEmail,
+        name.trim(),
+        phone ? String(phone).trim() : '',
+        assignedRole,
+        city ? String(city).trim() : 'Pune',
+        'active',
+        null,
+        hashedPassword,
+      ]
+    );
+
+    // 2. If salon owner, create salon entry + link users.salon_id + 3 starter services atomically
     if (assignedRole === 'owner') {
       assignedSalonId = `salon-${timestamp.toString().slice(-6)}-${randSuffix}`;
       await client.query(
@@ -449,6 +467,12 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
         ]
       );
 
+      // Link owner user record to the newly created salon (satisfies fk_users_salon)
+      await client.query(
+        'UPDATE users SET salon_id = $1 WHERE uid = $2',
+        [assignedSalonId, newUid]
+      );
+
       // Add 3 default services for this new salon
       await client.query(
         `INSERT INTO services (id, salon_id, category_id, name, description, price, duration, status)
@@ -464,24 +488,6 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
         ]
       );
     }
-
-    // Insert user WITHOUT PostgreSQL-only RETURNING clause (100% compatible with MariaDB 10.4+, MySQL 8+, PostgreSQL)
-    await client.query(
-      `INSERT INTO users (
-        uid, email, name, phone, role, city, status, salon_id, password, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
-      [
-        newUid,
-        normalizedEmail,
-        name.trim(),
-        phone ? String(phone).trim() : '',
-        assignedRole,
-        city ? String(city).trim() : 'Pune',
-        'active',
-        assignedSalonId,
-        hashedPassword,
-      ]
-    );
 
     const userSelect = await client.query(
       'SELECT id, uid, name, email, phone, role, city, status, salon_id, created_at FROM users WHERE uid = $1',
@@ -2018,6 +2024,14 @@ app.delete('/api/services/:id', requireAuth, async (req: Request, res: Response)
       if (!authUser.salonId || service.salon_id !== authUser.salonId) {
         return res.status(403).json({ error: 'Forbidden. You can only delete services belonging to your own salon.' });
       }
+    }
+
+    const linkedApts = await query('SELECT COUNT(*) AS count FROM appointments WHERE service_id = $1', [id]);
+    const aptCount = parseInt(linkedApts.rows[0]?.count || '0', 10);
+    if (aptCount > 0) {
+      return res.status(409).json({
+        error: `Cannot delete this service because ${aptCount} appointment(s) reference it. Set it to inactive instead to preserve booking history.`,
+      });
     }
 
     await query('DELETE FROM services WHERE id = $1', [id]);

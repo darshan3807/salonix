@@ -622,7 +622,9 @@ async function main() {
     const salonDb = await query('SELECT * FROM salons WHERE id = $1', [createdSalonId]);
     assert(salonDb.rows.length === 1, 'Owner salon row missing in database');
     assert(salonDb.rows[0].opening_time === '09:30' && salonDb.rows[0].closing_time === '20:30', `Expected normalized 24h hours 09:30-20:30, got ${salonDb.rows[0].opening_time}-${salonDb.rows[0].closing_time}`);
-    assert(salonDb.rows[0].working_days?.startsWith('['), `Expected JSON array working_days, got ${salonDb.rows[0].working_days}`);
+    const wdVal = salonDb.rows[0].working_days;
+    const wdValid = Array.isArray(wdVal) ? wdVal.length === 7 : typeof wdVal === 'string' && wdVal.startsWith('[');
+    assert(wdValid, `Expected valid JSON working_days, got ${JSON.stringify(wdVal)}`);
 
     const srvDb = await query('SELECT id FROM services WHERE salon_id = $1', [createdSalonId]);
     assert(srvDb.rows.length === 3, `Expected 3 starter services for new salon, got ${srvDb.rows.length}`);
@@ -647,6 +649,7 @@ async function main() {
     await query('DELETE FROM categories WHERE id = $1', [id]);
   }
   for (const sid of createdSalonIds) {
+    await query('UPDATE users SET salon_id = NULL WHERE salon_id = $1', [sid]);
     await query('DELETE FROM services WHERE salon_id = $1', [sid]);
     await query('DELETE FROM notifications WHERE target_salon_id = $1', [sid]);
     await query('DELETE FROM salons WHERE id = $1', [sid]);

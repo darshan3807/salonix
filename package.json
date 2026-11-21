@@ -8,7 +8,9 @@
     "build": "tsc && vite build",
     "start": "node server.ts",
     "lint": "tsc --noEmit",
-    "test": "tsx scripts/test_e2e.ts"
+    "test": "tsx scripts/test_e2e.ts",
+    "db:export-mysql": "tsx scripts/export_phpmyadmin.ts",
+    "db:verify": "tsx scripts/verify_mysql_migration.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import fs from 'fs';
 import bcrypt from 'bcryptjs';
 import pg from 'pg';
@@ -12,26 +13,45 @@ try {
   // Silent fallback
 }
 
-// Determine database driver: 'mysql' (MariaDB / MySQL / phpMyAdmin / XAMPP) or 'postgres' (PostgreSQL / Cloud SQL)
-const rawDriver = process.env.DB_DRIVER || (process.env.SQL_PORT === '3306' ? 'mysql' : '');
+// Determine database driver: 'mysql' / 'mariadb' (XAMPP / phpMyAdmin) or 'postgres' (PostgreSQL / Cloud SQL)
+const rawDriver =
+  process.env.DB_DRIVER ||
+  ((process.env.DB_PORT || process.env.SQL_PORT) === '3306' ? 'mysql' : '');
 export const isMySQL =
   rawDriver.toLowerCase() === 'mysql' ||
   rawDriver.toLowerCase() === 'mariadb' ||
-  (!process.env.SQL_HOST && !devConfig.SQL_HOST && !process.env.DATABASE_URL);
+  (!process.env.DB_HOST &&
+    !process.env.SQL_HOST &&
+    !devConfig.SQL_HOST &&
+    !process.env.DATABASE_URL);
+export const DB_DRIVER = isMySQL ? 'mysql' : 'postgres';
 
-const host = process.env.SQL_HOST || devConfig.SQL_HOST || 'localhost';
-const port = Number(process.env.SQL_PORT || devConfig.SQL_PORT) || (isMySQL ? 3306 : 5432);
-const user = process.env.SQL_USER || devConfig.SQL_USER || (isMySQL ? 'root' : 'postgres');
+const host =
+  process.env.DB_HOST ||
+  process.env.SQL_HOST ||
+  devConfig.SQL_HOST ||
+  (isMySQL ? '127.0.0.1' : 'localhost');
+const port =
+  Number(process.env.DB_PORT || process.env.SQL_PORT || devConfig.SQL_PORT) ||
+  (isMySQL ? 3306 : 5432);
+const user =
+  process.env.DB_USER ||
+  process.env.SQL_USER ||
+  devConfig.SQL_USER ||
+  (isMySQL ? 'root' : 'postgres');
 const password =
-  process.env.SQL_PASSWORD !== undefined
-    ? process.env.SQL_PASSWORD
-    : devConfig.SQL_PASSWORD || '';
+  process.env.DB_PASSWORD !== undefined
+    ? process.env.DB_PASSWORD
+    : process.env.SQL_PASSWORD !== undefined
+      ? process.env.SQL_PASSWORD
+      : devConfig.SQL_PASSWORD || '';
 const database =
+  process.env.DB_NAME ||
   process.env.SQL_DATABASE ||
   process.env.SQL_DB_NAME ||
   devConfig.SQL_DATABASE ||
   devConfig.SQL_DB_NAME ||
-  'salonix';
+  (isMySQL ? 'salonix_db' : 'salonix');
 
 // Create connection pools for PostgreSQL or MySQL/MariaDB
 let pgPool: pg.Pool | null = null;
@@ -48,6 +68,9 @@ if (isMySQL) {
     connectionLimit: 10,
     queueLimit: 0,
     enableKeepAlive: true,
+    // Keep SQL DATE columns as exact 'YYYY-MM-DD' strings and DECIMAL(10,2) columns as JS numbers
+    dateStrings: ['DATE'],
+    decimalNumbers: true,
   });
   console.log(`[DB] Connected with MySQL / MariaDB driver on ${host}:${port}/${database}`);
 } else {
@@ -292,133 +315,181 @@ async function ensureMySQLColumn(table: string, column: string, definition: stri
 async function runEnsureSchema(): Promise<void> {
   try {
     if (isMySQL && mysqlPool) {
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS users (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          uid VARCHAR(128) DEFAULT NULL,
-          email VARCHAR(255) NOT NULL UNIQUE,
-          name VARCHAR(255) NOT NULL,
-          phone VARCHAR(64) DEFAULT '',
-          role VARCHAR(32) DEFAULT 'customer',
-          city VARCHAR(128) DEFAULT 'Pune',
-          status VARCHAR(32) DEFAULT 'active',
-          salon_id VARCHAR(128) DEFAULT NULL,
-          password TEXT DEFAULT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          INDEX (email),
-          INDEX (role)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+      const conn = await mysqlPool.getConnection();
+      try {
+        await conn.query('SET FOREIGN_KEY_CHECKS = 0');
 
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS categories (
-          id VARCHAR(128) PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          description TEXT DEFAULT NULL,
-          icon_name VARCHAR(64) DEFAULT NULL
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS categories (
+            id VARCHAR(128) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            description TEXT DEFAULT NULL,
+            icon_name VARCHAR(64) DEFAULT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_categories_name (name)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
 
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS salons (
-          id VARCHAR(128) PRIMARY KEY,
-          owner_id VARCHAR(128) DEFAULT NULL,
-          owner_name VARCHAR(255) DEFAULT NULL,
-          name VARCHAR(255) NOT NULL,
-          tagline VARCHAR(255) DEFAULT NULL,
-          description TEXT DEFAULT NULL,
-          about TEXT DEFAULT NULL,
-          address TEXT DEFAULT NULL,
-          city VARCHAR(128) DEFAULT NULL,
-          state VARCHAR(128) DEFAULT NULL,
-          pincode VARCHAR(32) DEFAULT NULL,
-          phone VARCHAR(64) DEFAULT NULL,
-          email VARCHAR(255) DEFAULT NULL,
-          opening_time VARCHAR(16) DEFAULT NULL,
-          closing_time VARCHAR(16) DEFAULT NULL,
-          slot_duration_minutes INT DEFAULT 30,
-          break_start_time VARCHAR(16) DEFAULT NULL,
-          break_end_time VARCHAR(16) DEFAULT NULL,
-          working_days TEXT DEFAULT NULL,
-          rating FLOAT DEFAULT 0,
-          review_count INT DEFAULT 0,
-          starting_price INT DEFAULT 0,
-          featured TINYINT(1) DEFAULT 0,
-          status VARCHAR(32) DEFAULT 'active',
-          accent_color VARCHAR(32) DEFAULT '#b45309',
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          INDEX (city),
-          INDEX (owner_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS users (
+            id INT NOT NULL AUTO_INCREMENT,
+            uid VARCHAR(128) NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            phone VARCHAR(64) NOT NULL DEFAULT '',
+            role VARCHAR(32) NOT NULL DEFAULT 'customer',
+            city VARCHAR(128) NOT NULL DEFAULT 'Pune',
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            salon_id VARCHAR(128) DEFAULT NULL,
+            password TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_users_uid (uid),
+            UNIQUE KEY uq_users_email (email),
+            KEY idx_users_role (role),
+            KEY idx_users_city (city),
+            KEY idx_users_salon_id (salon_id),
+            CONSTRAINT fk_users_salon FOREIGN KEY (salon_id) REFERENCES salons (id)
+              ON DELETE SET NULL ON UPDATE CASCADE
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
 
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS services (
-          id VARCHAR(128) PRIMARY KEY,
-          salon_id VARCHAR(128) NOT NULL,
-          category_id VARCHAR(128) DEFAULT NULL,
-          name VARCHAR(255) NOT NULL,
-          description TEXT DEFAULT NULL,
-          price INT NOT NULL DEFAULT 0,
-          duration INT NOT NULL DEFAULT 30,
-          status VARCHAR(32) DEFAULT 'active',
-          INDEX (salon_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS salons (
+            id VARCHAR(128) NOT NULL,
+            owner_id VARCHAR(128) DEFAULT NULL,
+            owner_name VARCHAR(255) DEFAULT NULL,
+            name VARCHAR(255) NOT NULL,
+            tagline VARCHAR(255) DEFAULT NULL,
+            description TEXT DEFAULT NULL,
+            about TEXT DEFAULT NULL,
+            address TEXT DEFAULT NULL,
+            city VARCHAR(128) NOT NULL DEFAULT 'Pune',
+            state VARCHAR(128) DEFAULT NULL,
+            pincode VARCHAR(32) DEFAULT NULL,
+            phone VARCHAR(64) DEFAULT NULL,
+            email VARCHAR(255) DEFAULT NULL,
+            opening_time VARCHAR(16) NOT NULL DEFAULT '09:00',
+            closing_time VARCHAR(16) NOT NULL DEFAULT '20:00',
+            slot_duration_minutes INT NOT NULL DEFAULT 30,
+            break_start_time VARCHAR(16) DEFAULT NULL,
+            break_end_time VARCHAR(16) DEFAULT NULL,
+            working_days JSON DEFAULT NULL,
+            rating DECIMAL(3,2) NOT NULL DEFAULT 0.00,
+            review_count INT NOT NULL DEFAULT 0,
+            starting_price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            featured TINYINT(1) NOT NULL DEFAULT 0,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            accent_color VARCHAR(32) NOT NULL DEFAULT '#b45309',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_salons_owner_id (owner_id),
+            KEY idx_salons_city_status (city, status),
+            KEY idx_salons_featured (featured),
+            CONSTRAINT fk_salons_owner FOREIGN KEY (owner_id) REFERENCES users (uid)
+              ON DELETE RESTRICT ON UPDATE CASCADE
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
 
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS appointments (
-          id VARCHAR(128) PRIMARY KEY,
-          customer_id VARCHAR(128) NOT NULL,
-          customer_name VARCHAR(255) NOT NULL,
-          customer_phone VARCHAR(64) DEFAULT NULL,
-          customer_email VARCHAR(255) DEFAULT NULL,
-          salon_id VARCHAR(128) NOT NULL,
-          salon_name VARCHAR(255) DEFAULT NULL,
-          salon_city VARCHAR(128) DEFAULT NULL,
-          salon_address TEXT DEFAULT NULL,
-          service_id VARCHAR(128) NOT NULL,
-          service_name VARCHAR(255) DEFAULT NULL,
-          date VARCHAR(32) NOT NULL,
-          start_time VARCHAR(16) NOT NULL,
-          end_time VARCHAR(16) NOT NULL,
-          duration_minutes INT NOT NULL DEFAULT 30,
-          price INT NOT NULL DEFAULT 0,
-          status VARCHAR(32) NOT NULL DEFAULT 'pending',
-          notes TEXT DEFAULT NULL,
-          rejection_reason TEXT DEFAULT NULL,
-          cancellation_reason TEXT DEFAULT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          INDEX (customer_id),
-          INDEX (salon_id),
-          INDEX (date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS services (
+            id VARCHAR(128) NOT NULL,
+            salon_id VARCHAR(128) NOT NULL,
+            category_id VARCHAR(128) DEFAULT NULL,
+            name VARCHAR(255) NOT NULL,
+            description TEXT DEFAULT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            duration INT NOT NULL DEFAULT 30,
+            status VARCHAR(32) NOT NULL DEFAULT 'active',
+            PRIMARY KEY (id),
+            KEY idx_services_salon_id (salon_id),
+            KEY idx_services_category_id (category_id),
+            KEY idx_services_status (status),
+            CONSTRAINT fk_services_salon FOREIGN KEY (salon_id) REFERENCES salons (id)
+              ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT fk_services_category FOREIGN KEY (category_id) REFERENCES categories (id)
+              ON DELETE RESTRICT ON UPDATE CASCADE
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
 
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS notifications (
-          id VARCHAR(128) PRIMARY KEY,
-          target_role VARCHAR(32) DEFAULT NULL,
-          target_user_id VARCHAR(128) DEFAULT NULL,
-          target_salon_id VARCHAR(128) DEFAULT NULL,
-          title VARCHAR(255) NOT NULL,
-          message TEXT NOT NULL,
-          type VARCHAR(64) DEFAULT 'general',
-          \`read\` TINYINT(1) DEFAULT 0,
-          action_route VARCHAR(255) DEFAULT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          INDEX (target_user_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS appointments (
+            id VARCHAR(128) NOT NULL,
+            customer_id VARCHAR(128) NOT NULL,
+            customer_name VARCHAR(255) NOT NULL,
+            customer_phone VARCHAR(64) DEFAULT NULL,
+            customer_email VARCHAR(255) DEFAULT NULL,
+            salon_id VARCHAR(128) NOT NULL,
+            salon_name VARCHAR(255) DEFAULT NULL,
+            salon_city VARCHAR(128) DEFAULT NULL,
+            salon_address TEXT DEFAULT NULL,
+            service_id VARCHAR(128) NOT NULL,
+            service_name VARCHAR(255) DEFAULT NULL,
+            date DATE NOT NULL,
+            start_time VARCHAR(16) NOT NULL,
+            end_time VARCHAR(16) NOT NULL,
+            duration_minutes INT NOT NULL DEFAULT 30,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+            notes TEXT DEFAULT NULL,
+            rejection_reason TEXT DEFAULT NULL,
+            cancellation_reason TEXT DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_appointments_customer_id (customer_id),
+            KEY idx_appointments_salon_date (salon_id, date),
+            KEY idx_appointments_service_id (service_id),
+            KEY idx_appointments_status (status),
+            CONSTRAINT fk_appointments_customer FOREIGN KEY (customer_id) REFERENCES users (uid)
+              ON DELETE RESTRICT ON UPDATE CASCADE,
+            CONSTRAINT fk_appointments_salon FOREIGN KEY (salon_id) REFERENCES salons (id)
+              ON DELETE RESTRICT ON UPDATE CASCADE,
+            CONSTRAINT fk_appointments_service FOREIGN KEY (service_id) REFERENCES services (id)
+              ON DELETE RESTRICT ON UPDATE CASCADE
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
 
-      await mysqlPool.query(`
-        CREATE TABLE IF NOT EXISTS favorites (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          user_id VARCHAR(128) NOT NULL,
-          salon_id VARCHAR(128) NOT NULL,
-          UNIQUE KEY uniq_user_salon (user_id, salon_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS notifications (
+            id VARCHAR(128) NOT NULL,
+            target_role VARCHAR(32) DEFAULT NULL,
+            target_user_id VARCHAR(128) DEFAULT NULL,
+            target_salon_id VARCHAR(128) DEFAULT NULL,
+            title VARCHAR(255) NOT NULL,
+            message TEXT NOT NULL,
+            type VARCHAR(64) NOT NULL DEFAULT 'general',
+            \`read\` TINYINT(1) NOT NULL DEFAULT 0,
+            action_route VARCHAR(255) DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            KEY idx_notifications_user_read (target_user_id, \`read\`),
+            KEY idx_notifications_salon_id (target_salon_id),
+            KEY idx_notifications_role (target_role),
+            CONSTRAINT fk_notifications_user FOREIGN KEY (target_user_id) REFERENCES users (uid)
+              ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT fk_notifications_salon FOREIGN KEY (target_salon_id) REFERENCES salons (id)
+              ON DELETE CASCADE ON UPDATE CASCADE
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
+
+        await conn.query(`
+          CREATE TABLE IF NOT EXISTS favorites (
+            id INT NOT NULL AUTO_INCREMENT,
+            user_id VARCHAR(128) NOT NULL,
+            salon_id VARCHAR(128) NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_favorites_user_salon (user_id, salon_id),
+            KEY idx_favorites_salon_id (salon_id),
+            CONSTRAINT fk_favorites_user FOREIGN KEY (user_id) REFERENCES users (uid)
+              ON DELETE CASCADE ON UPDATE CASCADE,
+            CONSTRAINT fk_favorites_salon FOREIGN KEY (salon_id) REFERENCES salons (id)
+              ON DELETE CASCADE ON UPDATE CASCADE
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `);
+      } finally {
+        await conn.query('SET FOREIGN_KEY_CHECKS = 1');
+        conn.release();
+      }
 
       // Non-destructively ensure critical columns exist on pre-existing phpMyAdmin imports
       await ensureMySQLColumn('users', 'uid', 'VARCHAR(128) DEFAULT NULL');
@@ -429,7 +500,7 @@ async function runEnsureSchema(): Promise<void> {
       await ensureMySQLColumn('users', 'salon_id', 'VARCHAR(128) DEFAULT NULL');
       await ensureMySQLColumn('salons', 'break_start_time', 'VARCHAR(16) DEFAULT NULL');
       await ensureMySQLColumn('salons', 'break_end_time', 'VARCHAR(16) DEFAULT NULL');
-      await ensureMySQLColumn('salons', 'working_days', 'TEXT DEFAULT NULL');
+      await ensureMySQLColumn('salons', 'working_days', 'JSON DEFAULT NULL');
       await ensureMySQLColumn('salons', 'slot_duration_minutes', 'INT DEFAULT 30');
       await ensureMySQLColumn('appointments', 'rejection_reason', 'TEXT DEFAULT NULL');
       await ensureMySQLColumn('appointments', 'cancellation_reason', 'TEXT DEFAULT NULL');
