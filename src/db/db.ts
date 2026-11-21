@@ -8,21 +8,32 @@ try {
   if (fs.existsSync('/app/.dev.env.json')) {
     devConfig = JSON.parse(fs.readFileSync('/app/.dev.env.json', 'utf8'));
   }
-} catch (e) {
+} catch {
   // Silent fallback
 }
 
-// Determine database driver: 'mysql' (phpMyAdmin / XAMPP) or 'postgres'
+// Determine database driver: 'mysql' (MariaDB / MySQL / phpMyAdmin / XAMPP) or 'postgres' (PostgreSQL / Cloud SQL)
 const rawDriver = process.env.DB_DRIVER || (process.env.SQL_PORT === '3306' ? 'mysql' : '');
-export const isMySQL = rawDriver.toLowerCase() === 'mysql' || (!process.env.SQL_HOST && !devConfig.SQL_HOST && !process.env.DATABASE_URL);
+export const isMySQL =
+  rawDriver.toLowerCase() === 'mysql' ||
+  rawDriver.toLowerCase() === 'mariadb' ||
+  (!process.env.SQL_HOST && !devConfig.SQL_HOST && !process.env.DATABASE_URL);
 
 const host = process.env.SQL_HOST || devConfig.SQL_HOST || 'localhost';
 const port = Number(process.env.SQL_PORT || devConfig.SQL_PORT) || (isMySQL ? 3306 : 5432);
 const user = process.env.SQL_USER || devConfig.SQL_USER || (isMySQL ? 'root' : 'postgres');
-const password = process.env.SQL_PASSWORD !== undefined ? process.env.SQL_PASSWORD : (devConfig.SQL_PASSWORD || '');
-const database = process.env.SQL_DATABASE || process.env.SQL_DB_NAME || devConfig.SQL_DATABASE || devConfig.SQL_DB_NAME || 'salonix';
+const password =
+  process.env.SQL_PASSWORD !== undefined
+    ? process.env.SQL_PASSWORD
+    : devConfig.SQL_PASSWORD || '';
+const database =
+  process.env.SQL_DATABASE ||
+  process.env.SQL_DB_NAME ||
+  devConfig.SQL_DATABASE ||
+  devConfig.SQL_DB_NAME ||
+  'salonix';
 
-// Create connection pools for PostgreSQL or MySQL
+// Create connection pools for PostgreSQL or MySQL/MariaDB
 let pgPool: pg.Pool | null = null;
 let mysqlPool: mysql.Pool | null = null;
 
@@ -38,7 +49,7 @@ if (isMySQL) {
     queueLimit: 0,
     enableKeepAlive: true,
   });
-  console.log(`[DB] Connected with MySQL / phpMyAdmin driver on ${host}:${port}/${database}`);
+  console.log(`[DB] Connected with MySQL / MariaDB driver on ${host}:${port}/${database}`);
 } else {
   const { Pool } = pg;
   pgPool = new Pool({
@@ -47,64 +58,189 @@ if (isMySQL) {
     user,
     password,
     database,
+    max: 10,
+    idleTimeoutMillis: 15000,
+    connectionTimeoutMillis: 15000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10000,
   });
-  pgPool.on('error', (err) => {
-    console.error('Unexpected error on idle PostgreSQL client', err);
+  pgPool.on('error', (err: any) => {
+    const msg = String(err?.message || '');
+    const isTransientIdleDrop =
+      msg.includes('Connection terminated unexpectedly') ||
+      msg.includes('ECONNRESET') ||
+      msg.includes('EPIPE') ||
+      err?.code === '57P01';
+    if (isTransientIdleDrop) {
+      // Cloud SQL scale-to-zero closes idle sockets; pg.Pool automatically replaces the client on next query.
+      console.warn('[DB] Idle PostgreSQL connection closed by server; pool will reconnect on next query.');
+      return;
+    }
+    console.error('[DB] Unexpected PostgreSQL pool error:', msg);
   });
   console.log(`[DB] Connected with PostgreSQL driver on ${host}:${port}/${database}`);
 }
 
 export const pool = isMySQL ? (mysqlPool as any) : (pgPool as any);
 
+export interface QueryResult {
+  rows: any[];
+  rowCount: number;
+  insertId?: number;
+}
+
 export interface DbClient {
-  query: (text: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number }>;
+  query: (text: string, params?: any[]) => Promise<QueryResult>;
   release: () => void;
 }
 
 /**
- * Universal query runner:
- * Automatically converts Postgres parameter syntax ($1, $2, ...) to MySQL syntax (?, ?, ...)
- * and returns rows consistently across both database engines.
+ * Safely returns non-sensitive database metadata for admin overview & diagnostics.
  */
-export async function query(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
-  if (isMySQL && mysqlPool) {
-    let mysqlText = text.replace(/\$(\d+)/g, '?');
-    mysqlText = mysqlText.replace(/NOW\(\)/gi, 'NOW()');
+export function getDbConfigInfo() {
+  return {
+    engine: isMySQL ? 'MariaDB / MySQL' : 'PostgreSQL',
+    driver: isMySQL ? 'mysql2/promise' : 'pg (node-postgres)',
+    database,
+    connectionTarget: host.startsWith('/') ? 'Cloud SQL Unix Socket' : `${host}:${port}`,
+    isMySQL,
+  };
+}
 
-    const [rows] = await mysqlPool.execute(mysqlText, params || []);
+/**
+ * Detects transaction control statements that MUST NOT be sent through
+ * MariaDB/MySQL prepared statement protocol (COM_STMT_PREPARE).
+ */
+export function detectTransactionCommand(sql: string): 'BEGIN' | 'COMMIT' | 'ROLLBACK' | null {
+  const trimmed = sql.trim().replace(/;+$/, '').trim().toUpperCase();
+  if (trimmed === 'BEGIN' || trimmed === 'START TRANSACTION') return 'BEGIN';
+  if (trimmed === 'COMMIT') return 'COMMIT';
+  if (trimmed === 'ROLLBACK') return 'ROLLBACK';
+  return null;
+}
+
+/**
+ * Converts PostgreSQL-style parameterized SQL ($1, $2, ...) to MySQL/MariaDB (?, ?, ...):
+ * - Expands repeated or out-of-order positional placeholders accurately into ordered values
+ * - Strips PostgreSQL-only type casts (e.g. ::timestamptz)
+ * - Translates FOR SHARE -> LOCK IN SHARE MODE
+ * - Quotes MySQL/MariaDB reserved keyword `read` on notifications table queries
+ */
+export function convertPgToMySQL(
+  text: string,
+  params: any[] = []
+): { sql: string; values: any[] } {
+  const values: any[] = [];
+  let sql = text.replace(/\$(\d+)/g, (_match, numStr) => {
+    const idx = Number(numStr) - 1;
+    values.push(params[idx] === undefined ? null : params[idx]);
+    return '?';
+  });
+
+  // Remove PostgreSQL-only explicit casts (e.g. $1::timestamptz)
+  sql = sql.replace(/::[a-zA-Z0-9_]+/g, '');
+
+  // Convert PostgreSQL row share lock to MariaDB/MySQL compatible syntax
+  sql = sql.replace(/\bFOR\s+SHARE\b/gi, 'LOCK IN SHARE MODE');
+
+  // Safely quote `read` column in notifications table (reserved keyword in MariaDB/MySQL)
+  if (/\bnotifications\b/i.test(sql)) {
+    sql = sql
+      .replace(/(\(\s*[^)]*?,\s*)read(\s*,|\s*\))/gi, '$1`read`$2')
+      .replace(/(\bSET\s+)read(\s*=)/gi, '$1`read`$2')
+      .replace(/(\bWHERE\s+|\bAND\s+|\bOR\s+)read(\s*=)/gi, '$1`read`$2');
+  }
+
+  return { sql, values };
+}
+
+function isTransientConnectionError(err: any): boolean {
+  const msg = String(err?.message || '');
+  return (
+    msg.includes('Connection terminated unexpectedly') ||
+    msg.includes('ECONNRESET') ||
+    msg.includes('EPIPE') ||
+    err?.code === '57P01' ||
+    err?.code === '57P03'
+  );
+}
+
+/**
+ * Universal parameterized query runner supporting both PostgreSQL and MariaDB/MySQL.
+ */
+export async function query(text: string, params?: any[]): Promise<QueryResult> {
+  if (isMySQL && mysqlPool) {
+    const txCmd = detectTransactionCommand(text);
+    if (txCmd) {
+      await mysqlPool.query(txCmd);
+      return { rows: [], rowCount: 0 };
+    }
+
+    const { sql, values } = convertPgToMySQL(text, params || []);
+    const [rows] = await mysqlPool.execute(sql, values);
     const rowList = Array.isArray(rows) ? (rows as any[]) : [];
+    const meta = rows as any;
     return {
       rows: rowList,
-      rowCount: rowList.length || (rows as any).affectedRows || 0,
+      rowCount: Array.isArray(rows) ? rowList.length : meta?.affectedRows || 0,
+      insertId: meta?.insertId,
     };
   } else if (pgPool) {
-    const res = await pgPool.query(text, params);
-    return {
-      rows: res.rows,
-      rowCount: res.rowCount || 0,
-    };
+    const isReadOnlySelect =
+      /^\s*SELECT\b/i.test(text) && !/\bFOR\s+(UPDATE|SHARE)\b/i.test(text);
+    try {
+      const res = await pgPool.query(text, params);
+      return {
+        rows: res.rows,
+        rowCount: res.rowCount || 0,
+      };
+    } catch (err: any) {
+      if (isReadOnlySelect && isTransientConnectionError(err)) {
+        // Safe retry strictly for read-only SELECT queries after idle server disconnect (never retries writes)
+        const retryRes = await pgPool.query(text, params);
+        return {
+          rows: retryRes.rows,
+          rowCount: retryRes.rowCount || 0,
+        };
+      }
+      throw err;
+    }
   }
 
   throw new Error('Database pool is not initialized');
 }
 
 /**
- * Acquire a connection client supporting transactions for both MySQL and PostgreSQL
+ * Acquire a dedicated connection client supporting ACID transactions for both MariaDB/MySQL and PostgreSQL.
+ * On MariaDB/MySQL, BEGIN/COMMIT/ROLLBACK execute via native transaction methods (never prepared statements).
  */
 export async function getClient(): Promise<DbClient> {
   if (isMySQL && mysqlPool) {
     const conn = await mysqlPool.getConnection();
     return {
       query: async (text: string, params?: any[]) => {
-        let mysqlText = text.replace(/\$(\d+)/g, '?');
-        mysqlText = mysqlText.replace(/NOW\(\)/gi, 'NOW()');
-        // Handle postgres transaction lock syntax
-        mysqlText = mysqlText.replace(/FOR SHARE/gi, 'LOCK IN SHARE MODE');
-        const [rows] = await conn.execute(mysqlText, params || []);
+        const txCmd = detectTransactionCommand(text);
+        if (txCmd === 'BEGIN') {
+          await conn.beginTransaction();
+          return { rows: [], rowCount: 0 };
+        }
+        if (txCmd === 'COMMIT') {
+          await conn.commit();
+          return { rows: [], rowCount: 0 };
+        }
+        if (txCmd === 'ROLLBACK') {
+          await conn.rollback();
+          return { rows: [], rowCount: 0 };
+        }
+
+        const { sql, values } = convertPgToMySQL(text, params || []);
+        const [rows] = await conn.execute(sql, values);
         const rowList = Array.isArray(rows) ? (rows as any[]) : [];
+        const meta = rows as any;
         return {
           rows: rowList,
-          rowCount: rowList.length || (rows as any).affectedRows || 0,
+          rowCount: Array.isArray(rows) ? rowList.length : meta?.affectedRows || 0,
+          insertId: meta?.insertId,
         };
       },
       release: () => {
@@ -130,13 +266,32 @@ export async function getClient(): Promise<DbClient> {
   throw new Error('Database pool is not initialized');
 }
 
+let schemaInitPromise: Promise<void> | null = null;
+
 /**
- * Verifies or bootstraps tables for both MySQL (phpMyAdmin) and PostgreSQL.
+ * Verifies or bootstraps tables for both MySQL/MariaDB (phpMyAdmin) and PostgreSQL.
+ * Never drops, resets, or deletes existing data.
  */
-export async function ensureSchema() {
+export async function ensureSchema(): Promise<void> {
+  if (schemaInitPromise) return schemaInitPromise;
+  schemaInitPromise = runEnsureSchema();
+  return schemaInitPromise;
+}
+
+async function ensureMySQLColumn(table: string, column: string, definition: string) {
+  if (!mysqlPool) return;
+  const [cols] = await mysqlPool.query(
+    `SELECT COLUMN_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+    [table, column]
+  );
+  if (Array.isArray(cols) && cols.length === 0) {
+    await mysqlPool.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+  }
+}
+
+async function runEnsureSchema(): Promise<void> {
   try {
     if (isMySQL && mysqlPool) {
-      // Create users table for MySQL if missing
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS users (
           id INT AUTO_INCREMENT PRIMARY KEY,
@@ -155,7 +310,6 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
-      // Create categories
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS categories (
           id VARCHAR(128) PRIMARY KEY,
@@ -165,7 +319,6 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
-      // Create salons
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS salons (
           id VARCHAR(128) PRIMARY KEY,
@@ -199,7 +352,6 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
-      // Create services
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS services (
           id VARCHAR(128) PRIMARY KEY,
@@ -214,7 +366,6 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
-      // Create appointments
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS appointments (
           id VARCHAR(128) PRIMARY KEY,
@@ -233,7 +384,7 @@ export async function ensureSchema() {
           end_time VARCHAR(16) NOT NULL,
           duration_minutes INT NOT NULL DEFAULT 30,
           price INT NOT NULL DEFAULT 0,
-          status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+          status VARCHAR(32) NOT NULL DEFAULT 'pending',
           notes TEXT DEFAULT NULL,
           rejection_reason TEXT DEFAULT NULL,
           cancellation_reason TEXT DEFAULT NULL,
@@ -244,7 +395,6 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
-      // Create notifications
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS notifications (
           id VARCHAR(128) PRIMARY KEY,
@@ -261,7 +411,6 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
-      // Create favorites
       await mysqlPool.query(`
         CREATE TABLE IF NOT EXISTS favorites (
           id INT AUTO_INCREMENT PRIMARY KEY,
@@ -271,16 +420,31 @@ export async function ensureSchema() {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
       `);
 
+      // Non-destructively ensure critical columns exist on pre-existing phpMyAdmin imports
+      await ensureMySQLColumn('users', 'uid', 'VARCHAR(128) DEFAULT NULL');
+      await ensureMySQLColumn('users', 'password', 'TEXT DEFAULT NULL');
+      await ensureMySQLColumn('users', 'status', "VARCHAR(32) DEFAULT 'active'");
+      await ensureMySQLColumn('users', 'phone', "VARCHAR(64) DEFAULT ''");
+      await ensureMySQLColumn('users', 'city', "VARCHAR(128) DEFAULT 'Pune'");
+      await ensureMySQLColumn('users', 'salon_id', 'VARCHAR(128) DEFAULT NULL');
+      await ensureMySQLColumn('salons', 'break_start_time', 'VARCHAR(16) DEFAULT NULL');
+      await ensureMySQLColumn('salons', 'break_end_time', 'VARCHAR(16) DEFAULT NULL');
+      await ensureMySQLColumn('salons', 'working_days', 'TEXT DEFAULT NULL');
+      await ensureMySQLColumn('salons', 'slot_duration_minutes', 'INT DEFAULT 30');
+      await ensureMySQLColumn('appointments', 'rejection_reason', 'TEXT DEFAULT NULL');
+      await ensureMySQLColumn('appointments', 'cancellation_reason', 'TEXT DEFAULT NULL');
+      await ensureMySQLColumn('appointments', 'duration_minutes', 'INT NOT NULL DEFAULT 30');
+
       return;
     }
 
     // PostgreSQL path
     const check = await query(`
-      SELECT column_name 
-      FROM information_schema.columns 
+      SELECT column_name
+      FROM information_schema.columns
       WHERE table_name = 'users';
     `);
-    
+
     if (check.rows.length === 0) {
       await query(`
         CREATE TABLE IF NOT EXISTS users (
@@ -359,7 +523,10 @@ export async function migratePlaintextPasswords() {
         await query('UPDATE users SET password = $1 WHERE id = $2', [hash, u.id]);
         migrated++;
       } else {
-        const isBcrypt = u.password.startsWith('$2a$') || u.password.startsWith('$2b$') || u.password.startsWith('$2y$');
+        const isBcrypt =
+          u.password.startsWith('$2a$') ||
+          u.password.startsWith('$2b$') ||
+          u.password.startsWith('$2y$');
         if (!isBcrypt) {
           const hash = await bcrypt.hash(u.password, 10);
           await query('UPDATE users SET password = $1 WHERE id = $2', [hash, u.id]);
@@ -374,12 +541,3 @@ export async function migratePlaintextPasswords() {
     console.warn('[DB Security] Password migration notice:', err.message || err);
   }
 }
-
-// Automatically verify schema and run password migration on startup
-ensureSchema()
-  .then(() => migratePlaintextPasswords())
-  .catch((err) => {
-    if (err.message && !err.message.includes('permission denied')) {
-      console.warn('[DB] Auto schema sync notice:', err.message || err);
-    }
-  });

@@ -15,7 +15,7 @@ try {
   // ignore
 }
 
-import { query, pool } from '../src/db/db.ts';
+import { query, pool, convertPgToMySQL, detectTransactionCommand, getDbConfigInfo } from '../src/db/db.ts';
 
 const BASE_URL = process.env.TEST_BASE_URL || 'http://127.0.0.1:3000';
 
@@ -29,6 +29,8 @@ const results: TestResult[] = [];
 const createdAppointmentIds: string[] = [];
 const createdServiceIds: string[] = [];
 const createdCategoryIds: string[] = [];
+const createdUserEmails: string[] = [];
+const createdSalonIds: string[] = [];
 let testStartTimeIso = new Date().toISOString();
 
 async function runTest(name: string, fn: () => Promise<void>) {
@@ -87,11 +89,12 @@ async function main() {
   let originalCustomerProfile: { name: string; phone: string; city: string } | null = null;
   let customerUid = '';
 
-  // 1. Health check
-  await runTest('T1: Health endpoints (/api/health & /healthz)', async () => {
+  // 1. Health check & active DB metadata
+  await runTest('T1: Health endpoints (/api/health & /healthz) report active DB metadata', async () => {
     const h1 = await http('/api/health');
     const h2 = await http('/healthz');
     assert(h1.status === 200 && h1.data?.status === 'ok', `Expected 200 ok on /api/health, got ${h1.status}`);
+    assert(Boolean(h1.data?.database?.engine && h1.data?.database?.driver), 'Missing database engine metadata on /api/health');
     assert(h2.status === 200 && h2.data?.status === 'ok', `Expected 200 ok on /healthz, got ${h2.status}`);
   });
 
@@ -487,6 +490,151 @@ async function main() {
     assert(delNew.status === 200 && delNew.data?.success, 'Admin category delete failed');
   });
 
+  // 14. Cross-DB SQL Dialect & MariaDB/MySQL Adapter Verification
+  await runTest('T14: MariaDB/MySQL SQL Adapter & Zero PostgreSQL-only RETURNING Clauses', async () => {
+    // 1. Transaction commands must be intercepted (never sent to MariaDB prepared statements)
+    assert(detectTransactionCommand('BEGIN') === 'BEGIN', 'BEGIN not detected');
+    assert(detectTransactionCommand('BEGIN;') === 'BEGIN', 'BEGIN; not detected');
+    assert(detectTransactionCommand('COMMIT') === 'COMMIT', 'COMMIT not detected');
+    assert(detectTransactionCommand('ROLLBACK') === 'ROLLBACK', 'ROLLBACK not detected');
+    assert(detectTransactionCommand('SELECT * FROM users') === null, 'Regular SELECT falsely flagged as transaction');
+
+    // 2. Repeated positional params ($1 used multiple times) must expand accurately
+    const repeated = convertPgToMySQL(
+      'SELECT * FROM salons WHERE LOWER(name) LIKE LOWER($1) OR LOWER(city) LIKE LOWER($1)',
+      ['%pune%']
+    );
+    assert(repeated.values.length === 2 && repeated.values[0] === '%pune%' && repeated.values[1] === '%pune%', 'Repeated $1 param expansion failed');
+
+    // 3. FOR SHARE -> LOCK IN SHARE MODE & ::timestamptz cast stripped
+    const locked = convertPgToMySQL('SELECT * FROM salons WHERE id = $1 AND created_at >= $2::timestamptz FOR SHARE', ['salon-1', '2026-01-01']);
+    assert(locked.sql.includes('LOCK IN SHARE MODE') && !locked.sql.includes('FOR SHARE'), 'FOR SHARE translation failed');
+    assert(!locked.sql.includes('::timestamptz'), '::timestamptz cast stripping failed');
+
+    // 4. MariaDB reserved column `read` on notifications quoted safely in INSERT and UPDATE
+    const notifInsert = convertPgToMySQL(
+      `INSERT INTO notifications (\n id, title, type, read, action_route\n) VALUES ($1, $2, $3, false, $4)`,
+      ['n1', 'Hi', 'test', 'home']
+    );
+    assert(notifInsert.sql.includes('`read`'), 'Multiline INSERT notifications.read quoting failed');
+
+    const notifUpdate = convertPgToMySQL(
+      'UPDATE notifications SET read = true WHERE target_user_id = $1 AND read = false',
+      ['u1']
+    );
+    assert(notifUpdate.sql.includes('SET `read` = true') && notifUpdate.sql.includes('AND `read` = false'), 'UPDATE notifications.read quoting failed');
+
+    // 5. Verify server.ts contains ZERO SQL RETURNING clauses (ignore comments)
+    const serverSource = fs.readFileSync('server.ts', 'utf8').replace(/\/\/.*$/gm, '');
+    const returningSqlMatch = serverSource.match(/\bRETURNING\s+(\*|[a-z_]+(?:\s*,\s*[a-z_]+)*)/g);
+    assert(!returningSqlMatch, `Found PostgreSQL-only RETURNING clause(s) in server.ts: ${returningSqlMatch?.join(', ')}`);
+  });
+
+  // 15. Customer Registration End-to-End (Validation, Creation, Bcrypt, Duplicate 409, Login)
+  await runTest('T15: Customer Registration End-to-End, Bcrypt Verification, Duplicate 409 & Login', async () => {
+    // Reject invalid email
+    const badEmail = await http('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Test User', email: 'not-an-email', password: 'password123', role: 'customer' }),
+    });
+    assert(badEmail.status === 400, `Expected 400 for invalid email, got ${badEmail.status}`);
+
+    // Reject short password
+    const shortPwd = await http('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Test User', email: 'shortpwd@salonix.test', password: '123', role: 'customer' }),
+    });
+    assert(shortPwd.status === 400, `Expected 400 for short password, got ${shortPwd.status}`);
+
+    const regEmail = `e2e.cust.${Date.now()}@salonix.test`;
+    createdUserEmails.push(regEmail);
+    const reg = await http('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'E2E Registered Customer',
+        email: regEmail,
+        phone: '+91 98111 22334',
+        city: 'Pune',
+        password: 'TestPassword@123',
+        role: 'customer',
+      }),
+    });
+    assert(reg.status === 201 && reg.data?.success && reg.data?.token, `Customer registration failed: ${reg.status} ${JSON.stringify(reg.data)}`);
+    assert(reg.data?.user?.email === regEmail && reg.data?.user?.role === 'customer', 'Registered customer payload mismatch');
+    assert(!('password' in reg.data.user), 'Password must never be returned in registration response');
+
+    // Verify stored password in DB is bcrypt hash
+    const dbRow = await query('SELECT password, uid FROM users WHERE LOWER(email) = LOWER($1)', [regEmail]);
+    assert(dbRow.rows.length === 1, 'Registered customer not found in database');
+    assert(
+      String(dbRow.rows[0].password || '').startsWith('$2'),
+      'Registered customer password is NOT stored as a bcrypt hash'
+    );
+
+    // Duplicate email must return 409
+    const dup = await http('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Duplicate Customer',
+        email: regEmail,
+        password: 'TestPassword@123',
+        role: 'customer',
+      }),
+    });
+    assert(dup.status === 409, `Expected 409 for duplicate email, got ${dup.status}`);
+
+    // Login with newly registered credentials must succeed
+    const loginRes = await http('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: regEmail, password: 'TestPassword@123' }),
+    });
+    assert(loginRes.status === 200 && loginRes.data?.token, 'Login failed for newly registered customer');
+  });
+
+  // 16. Salon Owner Registration End-to-End (Atomic Owner + Salon + 3 Starter Services + Login)
+  await runTest('T16: Salon Owner Registration End-to-End (Owner + Salon + Starter Services + Login)', async () => {
+    const ownerRegEmail = `e2e.owner.${Date.now()}@salonix.test`;
+    createdUserEmails.push(ownerRegEmail);
+    const reg = await http('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'E2E Salon Partner',
+        email: ownerRegEmail,
+        phone: '+91 98222 33445',
+        city: 'Nashik',
+        password: 'OwnerPassword@123',
+        role: 'owner',
+        salonName: 'E2E Velvet Lounge',
+        salonAddress: 'Shop 9, College Road, Nashik',
+        openingTime: '09:30 AM',
+        closingTime: '08:30 PM',
+        startingPrice: 300,
+        aboutSalon: 'Temporary E2E salon partner registration verification',
+      }),
+    });
+    assert(reg.status === 201 && reg.data?.success && reg.data?.token, `Owner registration failed: ${reg.status} ${JSON.stringify(reg.data)}`);
+    assert(reg.data?.user?.role === 'owner', 'Registered owner role mismatch');
+    const createdSalonId = reg.data?.user?.salonId || reg.data?.user?.salon_id;
+    assert(Boolean(createdSalonId), 'Owner registration did not assign salonId');
+    createdSalonIds.push(createdSalonId);
+
+    // Verify salon + 3 default services exist in DB with normalized 24h hours & JSON working_days
+    const salonDb = await query('SELECT * FROM salons WHERE id = $1', [createdSalonId]);
+    assert(salonDb.rows.length === 1, 'Owner salon row missing in database');
+    assert(salonDb.rows[0].opening_time === '09:30' && salonDb.rows[0].closing_time === '20:30', `Expected normalized 24h hours 09:30-20:30, got ${salonDb.rows[0].opening_time}-${salonDb.rows[0].closing_time}`);
+    assert(salonDb.rows[0].working_days?.startsWith('['), `Expected JSON array working_days, got ${salonDb.rows[0].working_days}`);
+
+    const srvDb = await query('SELECT id FROM services WHERE salon_id = $1', [createdSalonId]);
+    assert(srvDb.rows.length === 3, `Expected 3 starter services for new salon, got ${srvDb.rows.length}`);
+
+    // Verify newly registered owner can log in
+    const loginRes = await http('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email: ownerRegEmail, password: 'OwnerPassword@123' }),
+    });
+    assert(loginRes.status === 200 && loginRes.data?.token && loginRes.data?.user?.role === 'owner', 'Login failed for newly registered owner');
+  });
+
   // Cleanup synthetic test records so existing database data stays spotless
   console.log('\nCleaning up synthetic E2E test records...');
   for (const id of createdAppointmentIds) {
@@ -498,12 +646,25 @@ async function main() {
   for (const id of createdCategoryIds) {
     await query('DELETE FROM categories WHERE id = $1', [id]);
   }
-  // Remove only notifications generated during this E2E test window
+  for (const sid of createdSalonIds) {
+    await query('DELETE FROM services WHERE salon_id = $1', [sid]);
+    await query('DELETE FROM notifications WHERE target_salon_id = $1', [sid]);
+    await query('DELETE FROM salons WHERE id = $1', [sid]);
+  }
+  for (const email of createdUserEmails) {
+    await query('DELETE FROM notifications WHERE message LIKE $1', [`%${email}%`]);
+    await query('DELETE FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+  }
+  // Remove only notifications generated during this E2E test window (cross-DB safe)
+  const dbInfo = getDbConfigInfo();
+  const formattedStart = dbInfo.isMySQL
+    ? testStartTimeIso.slice(0, 19).replace('T', ' ')
+    : testStartTimeIso;
   await query(
     `DELETE FROM notifications
-     WHERE created_at >= $1::timestamptz
+     WHERE created_at >= $1
        AND (target_user_id = $2 OR target_salon_id = $3)`,
-    [testStartTimeIso, customerUid, ownerSalonId]
+    [formattedStart, customerUid, ownerSalonId]
   );
 
   const passed = results.filter((r) => r.passed).length;

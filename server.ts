@@ -24,7 +24,7 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
-import { pool, query, getClient, ensureSchema, migratePlaintextPasswords } from './src/db/db.ts';
+import { pool, query, getClient, ensureSchema, migratePlaintextPasswords, getDbConfigInfo } from './src/db/db.ts';
 import { generateToken, requireAuth, requireRole, requireAdmin, requireSalonOwner, requireCustomer } from './src/middleware/auth.ts';
 import { serializeUser } from './src/lib/userSerializer.ts';
 import {
@@ -49,7 +49,12 @@ app.use(express.json());
 
 // Health Check Endpoints for Cloud Run / Container Probes
 app.get(['/healthz', '/api/health'], (_req: Request, res: Response) => {
-  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    database: getDbConfigInfo(),
+  });
 });
 
 // Helper: Create persistent PostgreSQL notification
@@ -298,12 +303,15 @@ app.patch('/api/auth/profile', requireAuth, async (req: Request, res: Response) 
     });
     params.push(authUser.id);
 
-    const updatedRes = await query(
-      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${params.length}
-       RETURNING id, uid, name, email, phone, role, city, status, salon_id, created_at`,
+    await query(
+      `UPDATE users SET ${setClauses.join(', ')} WHERE id = $${params.length}`,
       params
     );
 
+    const updatedRes = await query(
+      'SELECT id, uid, name, email, phone, role, city, status, salon_id, created_at FROM users WHERE id = $1',
+      [authUser.id]
+    );
     const updatedUser = updatedRes.rows[0];
     let salon = null;
     if (updatedUser.role === 'owner') {
@@ -325,8 +333,10 @@ app.patch('/api/auth/profile', requireAuth, async (req: Request, res: Response) 
   }
 });
 
-// 2. Auth: Register (Proper signup with admin approval required)
+// 2. Auth: Register (Cross-DB portable PostgreSQL & MariaDB/MySQL, transaction-safe)
 app.post('/api/auth/register', async (req: Request, res: Response) => {
+  const client = await getClient();
+  let inTransaction = false;
   try {
     const {
       name,
@@ -343,19 +353,28 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
       aboutSalon,
     } = req.body;
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: 'Name, email, and password are required' });
+    if (!name || typeof name !== 'string' || name.trim().length < 2) {
+      return res.status(400).json({ error: 'Full name is required (at least 2 characters).' });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    if (!email || typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ error: 'Please provide a valid email address.' });
+    }
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
     }
 
+    const assignedRole = role === 'owner' ? 'owner' : 'customer';
+    if (assignedRole === 'owner' && salonName !== undefined && typeof salonName === 'string' && salonName.trim().length === 0) {
+      return res.status(400).json({ error: 'Salon business name cannot be empty.' });
+    }
+
+    const normalizedEmail = email.trim();
     const hashedPassword = await bcrypt.hash(password, 10);
 
     // Check if email already registered
-    const existing = await query(
+    const existing = await client.query(
       'SELECT id, status, role FROM users WHERE LOWER(email) = LOWER($1)',
-      [email.trim()]
+      [normalizedEmail]
     );
 
     if (existing.rows.length > 0) {
@@ -370,15 +389,24 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
       });
     }
 
-    const assignedRole = role === 'owner' ? 'owner' : 'customer';
     const timestamp = Date.now();
-    const newUid = `usr-${assignedRole === 'owner' ? 'owner' : 'cust'}-${timestamp.toString().slice(-6)}`;
+    const randSuffix = Math.random().toString(36).slice(2, 6);
+    const newUid = `usr-${assignedRole === 'owner' ? 'owner' : 'cust'}-${timestamp.toString().slice(-6)}-${randSuffix}`;
     let assignedSalonId: string | null = null;
 
-    // If salon owner, create salon entry with pending status
+    // Normalize owner operating hours to standard 24h format (matching schema & slot engine)
+    const parsedOpenMin = timeStringToMinutes(openingTime) ?? timeStringToMinutes('09:00')!;
+    const parsedCloseMin = timeStringToMinutes(closingTime) ?? timeStringToMinutes('20:00')!;
+    const normalizedOpen = parsedOpenMin < parsedCloseMin ? minutesTo24HTime(parsedOpenMin) : '09:00';
+    const normalizedClose = parsedOpenMin < parsedCloseMin ? minutesTo24HTime(parsedCloseMin) : '20:00';
+
+    await client.query('BEGIN');
+    inTransaction = true;
+
+    // If salon owner, create salon entry with pending status + 3 starter services atomically
     if (assignedRole === 'owner') {
-      assignedSalonId = `salon-${timestamp.toString().slice(-6)}`;
-      await query(
+      assignedSalonId = `salon-${timestamp.toString().slice(-6)}-${randSuffix}`;
+      await client.query(
         `INSERT INTO salons (
           id, owner_id, owner_name, name, tagline, description, about,
           address, city, state, pincode, phone, email,
@@ -394,111 +422,97 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
           assignedSalonId,
           newUid,
           name.trim(),
-          salonName ? salonName.trim() : `${name.trim()}'s Salon`,
+          salonName && typeof salonName === 'string' && salonName.trim()
+            ? salonName.trim()
+            : `${name.trim()}'s Salon`,
           'Premium Hair, Beauty & Grooming Experience',
           aboutSalon || 'Professional salon offering haircuts, styling, skincare and grooming services.',
           aboutSalon || 'Book slots online with verified experienced stylists and aesthetic specialists.',
-          salonAddress || `${city || 'City Center'}, Main Road`,
-          city || 'Pune',
+          salonAddress && typeof salonAddress === 'string' && salonAddress.trim()
+            ? salonAddress.trim()
+            : `${city || 'City Center'}, Main Road`,
+          city ? String(city).trim() : 'Pune',
           'Maharashtra',
           '411001',
-          phone || '+91 98000 00000',
-          email.trim(),
-          openingTime || '09:00 AM',
-          closingTime || '08:00 PM',
+          phone ? String(phone).trim() : '+91 98000 00000',
+          normalizedEmail,
+          normalizedOpen,
+          normalizedClose,
           30,
-          'Mon - Sun (All 7 Days)',
+          JSON.stringify(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']),
           5.0,
           0,
-          Number(startingPrice) || 250,
+          Math.max(0, Number(startingPrice) || 250),
           false,
-          'pending', // Salon is also pending approval
+          'pending',
           '#0f172a',
         ]
       );
 
       // Add 3 default services for this new salon
-      await query(
+      await client.query(
         `INSERT INTO services (id, salon_id, category_id, name, description, price, duration, status)
          VALUES 
           ($1, $2, 'cat-hair', 'Signature Haircut & Styling', 'Custom haircut with wash and blow dry styling', 350, 30, 'active'),
           ($3, $2, 'cat-beard', 'Royal Beard Shaping & Trim', 'Precision beard trim with hot towel finish', 200, 20, 'active'),
-          ($4, $2, 'cat-facial', 'Glow Facial & Clean-Up', 'Deep cleansing and skin rejuvenation', 550, 45, 'active')
-        `,
+          ($4, $2, 'cat-facial', 'Glow Facial & Clean-Up', 'Deep cleansing and skin rejuvenation', 550, 45, 'active')`,
         [
-          `srv-${timestamp}-1`,
+          `srv-${timestamp}-${randSuffix}-1`,
           assignedSalonId,
-          `srv-${timestamp}-2`,
-          `srv-${timestamp}-3`,
+          `srv-${timestamp}-${randSuffix}-2`,
+          `srv-${timestamp}-${randSuffix}-3`,
         ]
       );
     }
 
-    // Insert user into PostgreSQL with active status
-    let userInsert;
-    try {
-      userInsert = await query(
-        `INSERT INTO users (
-          uid, email, name, phone, role, city, status, salon_id, password, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-        RETURNING id, uid, name, email, phone, role, city, status, salon_id, created_at`,
-        [
-          newUid,
-          email.trim(),
-          name.trim(),
-          phone ? phone.trim() : '',
-          assignedRole,
-          city ? city.trim() : 'Pune',
-          'active',
-          assignedSalonId,
-          hashedPassword,
-        ]
-      );
-    } catch (insertErr: any) {
-      if (insertErr.message && (insertErr.message.includes('password') || insertErr.message.includes('column'))) {
-        console.warn('Users table missing column, executing schema update and retrying:', insertErr.message);
-        await ensureSchema();
-        userInsert = await query(
-          `INSERT INTO users (
-            uid, email, name, phone, role, city, status, salon_id, password, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-          RETURNING id, uid, name, email, phone, role, city, status, salon_id, created_at`,
-          [
-            newUid,
-            email.trim(),
-            name.trim(),
-            phone ? phone.trim() : '',
-            assignedRole,
-            city ? city.trim() : 'Pune',
-            'active',
-            assignedSalonId,
-            hashedPassword,
-          ]
-        );
-      } else {
-        throw insertErr;
-      }
-    }
-
-    const newUser = userInsert.rows[0];
-
-    // Create admin notification
-    await query(
-      `INSERT INTO notifications (id, target_role, target_user_id, target_salon_id, title, message, type, read, action_route, created_at)
-       VALUES ($1, 'admin', NULL, $2, $3, $4, 'new_user', false, '/admin/approvals', NOW())`,
+    // Insert user WITHOUT PostgreSQL-only RETURNING clause (100% compatible with MariaDB 10.4+, MySQL 8+, PostgreSQL)
+    await client.query(
+      `INSERT INTO users (
+        uid, email, name, phone, role, city, status, salon_id, password, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())`,
       [
-        `notif-${timestamp}`,
+        newUid,
+        normalizedEmail,
+        name.trim(),
+        phone ? String(phone).trim() : '',
+        assignedRole,
+        city ? String(city).trim() : 'Pune',
+        'active',
         assignedSalonId,
-        `New ${assignedRole === 'owner' ? 'Salon Owner' : 'Customer'} Registered`,
-        `${newUser.name} (${newUser.email}) joined as a ${assignedRole === 'owner' ? 'Salon Partner' : 'Customer'}.`
+        hashedPassword,
       ]
     );
 
+    const userSelect = await client.query(
+      'SELECT id, uid, name, email, phone, role, city, status, salon_id, created_at FROM users WHERE uid = $1',
+      [newUid]
+    );
+
+    if (userSelect.rows.length === 0) {
+      throw new Error('Failed to retrieve newly created user record.');
+    }
+
+    const newUser = userSelect.rows[0];
+
+    // Create admin notification
+    await createNotification(client, {
+      targetRole: 'admin',
+      targetUserId: null,
+      targetSalonId: assignedSalonId,
+      title: `New ${assignedRole === 'owner' ? 'Salon Owner' : 'Customer'} Registered`,
+      message: `${newUser.name} (${newUser.email}) joined as a ${assignedRole === 'owner' ? 'Salon Partner' : 'Customer'}.`,
+      type: 'new_user',
+      actionRoute: 'admin-dashboard',
+    });
+
     let salonData = null;
     if (assignedSalonId) {
-      const sRes = await query('SELECT * FROM salons WHERE id = $1', [assignedSalonId]);
+      const sRes = await client.query('SELECT * FROM salons WHERE id = $1', [assignedSalonId]);
       if (sRes.rows.length > 0) salonData = sRes.rows[0];
     }
+
+    await client.query('COMMIT');
+    inTransaction = false;
 
     const safeUser = serializeUser(newUser, salonData);
     const token = generateToken({
@@ -517,8 +531,21 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
       user: safeUser,
     });
   } catch (err: any) {
+    if (inTransaction) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+    }
+    // Handle concurrent duplicate email insertion cleanly across PostgreSQL (23505) & MariaDB/MySQL (ER_DUP_ENTRY)
+    if (err?.code === '23505' || err?.code === 'ER_DUP_ENTRY' || err?.errno === 1062) {
+      return res.status(409).json({
+        error: 'An account with this email already exists. Please log in instead.',
+      });
+    }
     console.error('Register error:', err);
     return res.status(500).json({ error: 'Server error during registration: ' + err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -570,15 +597,13 @@ app.post('/api/admin/users/:id/action', requireAuth, requireAdmin, async (req: R
 
     const newStatus = action === 'approve' ? 'active' : 'rejected';
 
-    const userRes = await query(
-      `UPDATE users SET status = $1 WHERE id = $2 RETURNING *`,
-      [newStatus, id]
-    );
-
-    if (userRes.rows.length === 0) {
+    const existingUserRes = await query('SELECT id FROM users WHERE id = $1', [id]);
+    if (existingUserRes.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    await query(`UPDATE users SET status = $1 WHERE id = $2`, [newStatus, id]);
+    const userRes = await query('SELECT * FROM users WHERE id = $1', [id]);
     const updatedUser = userRes.rows[0];
 
     // If salon owner, also update the salon status
@@ -608,15 +633,14 @@ app.post('/api/admin/salons/:id/action', requireAuth, requireAdmin, async (req: 
     const { id } = req.params;
     const { action } = req.body; // 'approve' | 'reject'
 
-    const newStatus = action === 'approve' ? 'approved' : 'rejected';
-    const salonRes = await query(
-      `UPDATE salons SET status = $1 WHERE id = $2 RETURNING *`,
-      [newStatus, id]
-    );
-
-    if (salonRes.rows.length === 0) {
+    const existingSalonRes = await query('SELECT id FROM salons WHERE id = $1', [id]);
+    if (existingSalonRes.rows.length === 0) {
       return res.status(404).json({ error: 'Salon not found' });
     }
+
+    const newStatus = action === 'approve' ? 'approved' : 'rejected';
+    await query(`UPDATE salons SET status = $1 WHERE id = $2`, [newStatus, id]);
+    const salonRes = await query('SELECT * FROM salons WHERE id = $1', [id]);
 
     // Also update owner status if needed
     if (action === 'approve' && salonRes.rows[0].owner_id) {
@@ -670,10 +694,10 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req: Request, res:
 app.get('/api/admin/stats', requireAuth, requireAdmin, async (_req: Request, res: Response) => {
   try {
     const [pendingRes, usersRes, salonsRes, appointmentsRes] = await Promise.all([
-      query(`SELECT COUNT(*) FROM users WHERE status = 'pending'`),
-      query(`SELECT COUNT(*) FROM users WHERE status = 'active'`),
-      query(`SELECT COUNT(*) FROM salons WHERE status = 'approved'`),
-      query(`SELECT COUNT(*) FROM appointments`),
+      query(`SELECT COUNT(*) AS count FROM users WHERE status = 'pending'`),
+      query(`SELECT COUNT(*) AS count FROM users WHERE status = 'active'`),
+      query(`SELECT COUNT(*) AS count FROM salons WHERE status = 'approved'`),
+      query(`SELECT COUNT(*) AS count FROM appointments`),
     ]);
 
     return res.json({
@@ -751,6 +775,7 @@ app.get('/api/salons', async (req: Request, res: Response) => {
 
       return {
         ...salon,
+        featured: Boolean(salon.featured),
         services: salonServices,
         category_ids: categoryIds,
         service_count: salonServices.length,
@@ -784,7 +809,7 @@ app.get('/api/salons/:id', async (req: Request, res: Response) => {
     );
 
     return res.json({
-      salon: salonRes.rows[0],
+      salon: { ...salonRes.rows[0], featured: Boolean(salonRes.rows[0].featured) },
       services: servicesRes.rows,
     });
   } catch (err: any) {
@@ -1105,14 +1130,14 @@ app.patch('/api/salons/:id', requireAuth, async (req: Request, res: Response) =>
       UPDATE salons
       SET ${setClauses.join(', ')}
       WHERE id = $${queryParams.length}
-      RETURNING *
     `;
 
-    const updateRes = await query(updateSql, queryParams);
+    await query(updateSql, queryParams);
+    const updateRes = await query('SELECT * FROM salons WHERE id = $1', [id]);
 
     return res.json({
       success: true,
-      salon: updateRes.rows[0],
+      salon: { ...updateRes.rows[0], featured: Boolean(updateRes.rows[0].featured) },
       message: 'Salon details updated successfully!',
     });
   } catch (err: any) {
@@ -1267,12 +1292,13 @@ app.post('/api/admin/categories', requireAuth, requireAdmin, async (req: Request
       .replace(/(^-|-$)/g, '');
     const catId = `cat-${slug || Date.now()}-${Date.now().toString().slice(-4)}`;
 
-    const result = await query(
+    await query(
       `INSERT INTO categories (id, name, description, icon_name)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
+       VALUES ($1, $2, $3, $4)`,
       [catId, name.trim(), typeof description === 'string' ? description.trim() : '', iconName]
     );
+
+    const result = await query('SELECT * FROM categories WHERE id = $1', [catId]);
 
     return res.status(201).json({
       success: true,
@@ -1289,7 +1315,12 @@ app.post('/api/admin/categories', requireAuth, requireAdmin, async (req: Request
 app.delete('/api/admin/categories/:id', requireAuth, requireAdmin, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const inUseRes = await query('SELECT COUNT(*) FROM services WHERE category_id = $1', [id]);
+    const existsRes = await query('SELECT id FROM categories WHERE id = $1', [id]);
+    if (existsRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+
+    const inUseRes = await query('SELECT COUNT(*) AS count FROM services WHERE category_id = $1', [id]);
     const count = parseInt(inUseRes.rows[0]?.count || '0', 10);
     if (count > 0) {
       return res.status(409).json({
@@ -1297,10 +1328,7 @@ app.delete('/api/admin/categories/:id', requireAuth, requireAdmin, async (req: R
       });
     }
 
-    const delRes = await query('DELETE FROM categories WHERE id = $1 RETURNING *', [id]);
-    if (delRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Category not found.' });
-    }
+    await query('DELETE FROM categories WHERE id = $1', [id]);
 
     return res.json({
       success: true,
@@ -1338,10 +1366,11 @@ app.get('/api/notifications', requireAuth, async (req: Request, res: Response) =
     }
 
     const result = await query(sql, params);
-    const unreadCount = result.rows.filter((n: any) => !n.read).length;
+    const normalized = result.rows.map((n: any) => ({ ...n, read: Boolean(n.read) }));
+    const unreadCount = normalized.filter((n: any) => !n.read).length;
 
     return res.json({
-      notifications: result.rows,
+      notifications: normalized,
       unreadCount,
     });
   } catch (err: any) {
@@ -1401,14 +1430,13 @@ app.patch('/api/notifications/:id/read', requireAuth, async (req: Request, res: 
       return res.status(403).json({ error: 'Forbidden. You cannot update this notification.' });
     }
 
-    const updated = await query(
-      'UPDATE notifications SET read = true WHERE id = $1 RETURNING *',
-      [id]
-    );
+    await query('UPDATE notifications SET read = true WHERE id = $1', [id]);
+    const updated = await query('SELECT * FROM notifications WHERE id = $1', [id]);
+    const updatedNotif = updated.rows[0] ? { ...updated.rows[0], read: Boolean(updated.rows[0].read) } : null;
 
     return res.json({
       success: true,
-      notification: updated.rows[0],
+      notification: updatedNotif,
     });
   } catch (err: any) {
     console.error('Mark notification read error:', err);
@@ -1607,11 +1635,11 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
     }
 
     // 12. Insert the appointment with server-calculated fields (starts as pending for owner review)
-    const appointmentId = `apt-${Date.now()}`;
+    const appointmentId = `apt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const calculatedStartTime = minutesToDisplayTime(startMinutes);
     const calculatedEndTime = minutesToDisplayTime(endMinutes);
 
-    const insertRes = await client.query(
+    await client.query(
       `INSERT INTO appointments (
         id, customer_id, customer_name, customer_phone, customer_email,
         salon_id, salon_name, salon_city, salon_address,
@@ -1622,7 +1650,7 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
         $6, $7, $8, $9,
         $10, $11, $12, $13, $14,
         $15, $16, 'pending', $17, NOW()
-      ) RETURNING *`,
+      )`,
       [
         appointmentId,
         bookingCustomerId,
@@ -1643,6 +1671,8 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
         notes || '',
       ]
     );
+
+    const insertedAptRes = await client.query('SELECT * FROM appointments WHERE id = $1', [appointmentId]);
 
     // 12b. Create real notifications for both Salon Owner and Customer inside transaction
     await createNotification(client, {
@@ -1670,7 +1700,7 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
 
     return res.status(201).json({
       success: true,
-      appointment: insertRes.rows[0],
+      appointment: insertedAptRes.rows[0],
       message: 'Appointment request submitted! Awaiting salon confirmation.',
     });
   } catch (err: any) {
@@ -1759,14 +1789,14 @@ app.patch('/api/appointments/:id/status', requireAuth, async (req: Request, res:
             .trim()
         : apt.cancellation_reason || null;
 
-    const result = await query(
+    await query(
       `UPDATE appointments
        SET status = $1, rejection_reason = $2, cancellation_reason = $3
-       WHERE id = $4
-       RETURNING *`,
+       WHERE id = $4`,
       [status, finalRejectionReason, finalCancellationReason, id]
     );
 
+    const result = await query('SELECT * FROM appointments WHERE id = $1', [id]);
     const updatedApt = result.rows[0];
 
     // Emit real counterparty notification
@@ -1877,11 +1907,10 @@ app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Service duration must be between 5 and 480 minutes.' });
     }
 
-    const srvId = `srv-${Date.now()}`;
-    const result = await query(
+    const srvId = `srv-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    await query(
       `INSERT INTO services (id, salon_id, category_id, name, description, price, duration, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-       RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')`,
       [
         srvId,
         targetSalonId,
@@ -1892,6 +1921,8 @@ app.post('/api/services', requireAuth, async (req: Request, res: Response) => {
         Math.round(parsedDuration),
       ]
     );
+
+    const result = await query('SELECT * FROM services WHERE id = $1', [srvId]);
 
     return res.status(201).json({
       success: true,
@@ -1947,13 +1978,14 @@ app.patch('/api/services/:id', requireAuth, async (req: Request, res: Response) 
       return res.status(400).json({ error: 'Service duration must be between 5 and 480 minutes.' });
     }
 
-    const result = await query(
+    await query(
       `UPDATE services
        SET name = $1, description = $2, price = $3, duration = $4, category_id = $5, status = $6
-       WHERE id = $7
-       RETURNING *`,
+       WHERE id = $7`,
       [updatedName, updatedDesc, Math.round(updatedPrice), Math.round(updatedDuration), updatedCat, updatedStatus, id]
     );
+
+    const result = await query('SELECT * FROM services WHERE id = $1', [id]);
 
     return res.json({
       success: true,

@@ -156,7 +156,7 @@ async function generatePhpMyAdminSql() {
   out += '  `end_time` varchar(16) NOT NULL,\n';
   out += '  `duration_minutes` int(11) NOT NULL DEFAULT 30,\n';
   out += '  `price` int(11) NOT NULL DEFAULT 0,\n';
-  out += '  `status` varchar(32) NOT NULL DEFAULT \'confirmed\',\n';
+  out += '  `status` varchar(32) NOT NULL DEFAULT \'pending\',\n';
   out += '  `notes` text DEFAULT NULL,\n';
   out += '  `rejection_reason` text DEFAULT NULL,\n';
   out += '  `cancellation_reason` text DEFAULT NULL,\n';

@@ -101,6 +101,9 @@ export function isSalonOpenOnDate(workingDaysField: string | string[] | null | u
     daysList = workingDaysField.map(d => d.trim().toLowerCase());
   } else if (typeof workingDaysField === 'string') {
     const raw = workingDaysField.trim();
+    if (/all\s*7|mon\s*-\s*sun|daily|every\s*day/i.test(raw)) {
+      return true;
+    }
     if (raw.startsWith('[') && raw.endsWith(']')) {
       try {
         const parsed = JSON.parse(raw);
