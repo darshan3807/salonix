@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { apiFetch } from '../lib/api.ts';
+import { isDatePassed } from '../lib/slotUtils.ts';
 import {
   Users,
   Store,
@@ -15,12 +16,13 @@ import {
   Plus,
   Trash2,
   AlertTriangle,
+  ArrowLeft,
 } from 'lucide-react';
 
 type AdminTab = 'pending' | 'users' | 'salons' | 'appointments' | 'categories';
 
 export const AdminDashboard: React.FC = () => {
-  const { user, categories, refreshPendingCount, refreshCategories, refreshSalons } = useApp();
+  const { user, categories, refreshPendingCount, refreshCategories, refreshSalons, goBack } = useApp();
   const [activeTab, setActiveTab] = useState<AdminTab>('pending');
 
   const [pendingUsers, setPendingUsers] = useState<any[]>([]);
@@ -227,6 +229,18 @@ export const AdminDashboard: React.FC = () => {
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+
+      {/* Back button */}
+      <div className="mb-6">
+        <button
+          type="button"
+          onClick={goBack}
+          className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-purple-600 cursor-pointer transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <span>Back</span>
+        </button>
+      </div>
 
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-8 border-b border-slate-200">
@@ -743,9 +757,15 @@ export const AdminDashboard: React.FC = () => {
                     <td className="py-3 px-4 text-xs text-slate-800">{apt.service_name}</td>
                     <td className="py-3 px-4 text-xs font-bold text-slate-900">₹{apt.price}</td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-0.5 rounded-md text-xs font-bold capitalize ${getAptBadge(apt.status)}`}>
-                        {apt.status}
-                      </span>
+                      {isDatePassed(apt.date) && String(apt.status).toLowerCase() !== 'cancelled' && String(apt.status).toLowerCase() !== 'rejected' ? (
+                        <span className="px-2 py-0.5 rounded-md text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                          Appointment Completed
+                        </span>
+                      ) : (
+                        <span className={`px-2 py-0.5 rounded-md text-xs font-bold capitalize ${getAptBadge(apt.status)}`}>
+                          {apt.status}
+                        </span>
+                      )}
                     </td>
                   </tr>
                 ))}

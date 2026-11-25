@@ -2,11 +2,11 @@ import React, { useState } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { 
   Search, MapPin, Scissors, Sparkles, Star, Clock, 
-  ShieldCheck, ArrowRight, CheckCircle2, Heart, Award, Users, Store
+  ShieldCheck, ArrowRight, CheckCircle2, Heart, Award, Users, Store, ArrowLeft
 } from 'lucide-react';
 
 export const HomePage: React.FC = () => {
-  const { salons, categories, navigateTo, navigateToSalonsWithFilters } = useApp();
+  const { salons, categories, navigateTo, navigateToSalonsWithFilters, goBack } = useApp();
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCity, setSelectedCity] = useState('All');
 
@@ -27,9 +27,21 @@ export const HomePage: React.FC = () => {
     <div className="space-y-16 pb-20">
       
       {/* Hero Section */}
-      <section className="relative overflow-hidden bg-gradient-to-b from-slate-950 via-slate-900 to-indigo-950 text-white pt-16 pb-24 px-4 sm:px-6 lg:px-8">
+      <section className="relative overflow-hidden bg-gradient-to-b from-slate-950 via-slate-900 to-indigo-950 text-white pt-12 pb-24 px-4 sm:px-6 lg:px-8">
         <div className="absolute inset-0 opacity-15 bg-[radial-gradient(#9333ea_1px,transparent_1px)] [background-size:16px_16px]"></div>
         
+        {/* Back Button */}
+        <div className="relative max-w-5xl mx-auto mb-6 text-left">
+          <button
+            type="button"
+            onClick={goBack}
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-300 hover:text-white transition-colors cursor-pointer bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg px-3 py-1.5 shadow-xs"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Back</span>
+          </button>
+        </div>
+
         <div className="relative max-w-5xl mx-auto text-center space-y-6">
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider bg-purple-500/10 border border-purple-500/30 text-purple-300">
             <Sparkles className="w-3.5 h-3.5 text-purple-400" />

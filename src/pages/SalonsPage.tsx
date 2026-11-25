@@ -35,7 +35,7 @@ function formatWorkingDays(raw?: string | string[]): string {
 }
 
 export const SalonsPage: React.FC = () => {
-  const { salons, categories, discoveryFilters, setDiscoveryFilters, navigateTo } = useApp();
+  const { salons, categories, discoveryFilters, setDiscoveryFilters, navigateTo, goBack } = useApp();
 
   const [searchTerm, setSearchTerm] = useState(discoveryFilters.search || '');
   const [selectedCity, setSelectedCity] = useState(discoveryFilters.city || 'All');
@@ -128,11 +128,12 @@ export const SalonsPage: React.FC = () => {
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
           <button
-            onClick={() => navigateTo('home')}
+            type="button"
+            onClick={goBack}
             className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-purple-600 mb-2 cursor-pointer transition-colors"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
-            <span>Back to Home</span>
+            <span>Back</span>
           </button>
           <h1 className="text-3xl font-serif font-bold text-slate-900">
             Discover & Compare Verified Salons

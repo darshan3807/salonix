@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Appointment } from '../types/index.ts';
 import { apiFetch } from '../lib/api.ts';
+import { isDatePassed } from '../lib/slotUtils.ts';
 import {
   Calendar,
   Clock,
@@ -17,6 +18,7 @@ import {
   X,
   Save,
   RefreshCw,
+  ArrowLeft,
 } from 'lucide-react';
 
 type CustomerTab = 'upcoming' | 'history' | 'notifications' | 'profile';
@@ -28,6 +30,7 @@ export const CustomerDashboard: React.FC = () => {
     notifications,
     unreadNotificationsCount,
     navigateTo,
+    goBack,
     updateUser,
     refreshNotifications,
     markNotificationRead,
@@ -101,8 +104,10 @@ export const CustomerDashboard: React.FC = () => {
   const historyAppointments = useMemo(() => {
     return appointments.filter((apt) => {
       const st = String(apt.status || '').toLowerCase();
-      if (st === 'pending' || st === 'confirmed') return false;
+      const passed = isDatePassed(apt.date);
+      if ((st === 'pending' || st === 'confirmed') && !passed) return false;
       if (historyFilter === 'all') return true;
+      if (historyFilter === 'completed') return st === 'completed' || passed;
       return st === historyFilter;
     });
   }, [appointments, historyFilter]);
@@ -192,8 +197,31 @@ export const CustomerDashboard: React.FC = () => {
     }
   };
 
-  const renderStatusBadge = (rawStatus: string) => {
+  const renderStatusBadge = (rawStatus: string, dateStr?: string) => {
     const st = rawStatus.toLowerCase();
+    const passed = dateStr ? isDatePassed(dateStr) : false;
+
+    if (st === 'cancelled') {
+      return (
+        <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-slate-100 text-slate-700 border border-slate-200 whitespace-nowrap">
+          Cancelled
+        </span>
+      );
+    }
+    if (st === 'rejected') {
+      return (
+        <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-200 whitespace-nowrap">
+          Rejected
+        </span>
+      );
+    }
+    if (st === 'completed' || passed) {
+      return (
+        <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-emerald-100 text-emerald-800 border border-emerald-200 whitespace-nowrap">
+          Appointment Completed
+        </span>
+      );
+    }
     if (st === 'pending') {
       return (
         <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-amber-100 text-amber-800 border border-amber-200 whitespace-nowrap">
@@ -208,20 +236,6 @@ export const CustomerDashboard: React.FC = () => {
         </span>
       );
     }
-    if (st === 'completed') {
-      return (
-        <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-indigo-100 text-indigo-800 border border-indigo-200 whitespace-nowrap">
-          Completed
-        </span>
-      );
-    }
-    if (st === 'rejected') {
-      return (
-        <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-rose-100 text-rose-800 border border-rose-200 whitespace-nowrap">
-          Rejected
-        </span>
-      );
-    }
     return (
       <span className="px-2.5 py-0.5 rounded-md text-[11px] font-bold uppercase tracking-wider bg-slate-100 text-slate-700 border border-slate-200 whitespace-nowrap">
         {st}
@@ -231,6 +245,7 @@ export const CustomerDashboard: React.FC = () => {
 
   const renderAppointmentCard = (apt: Appointment, showCancel: boolean) => {
     const st = String(apt.status || '').toLowerCase();
+    const passed = isDatePassed(apt.date);
     const reasonText = apt.rejection_reason || apt.cancellation_reason;
 
     return (
@@ -249,7 +264,7 @@ export const CustomerDashboard: React.FC = () => {
                 </span>
               </p>
             </div>
-            {renderStatusBadge(st)}
+            {renderStatusBadge(st, apt.date)}
           </div>
 
           <div className="p-3.5 bg-slate-50 rounded-xl space-y-1.5 text-xs text-slate-700 border border-slate-200/60 tabular-nums">
@@ -271,7 +286,7 @@ export const CustomerDashboard: React.FC = () => {
             </div>
           </div>
 
-          {st === 'pending' && (
+          {st === 'pending' && !passed && (
             <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
               Your slot is reserved and awaiting confirmation from the salon owner.
             </p>
@@ -286,7 +301,12 @@ export const CustomerDashboard: React.FC = () => {
         </div>
 
         <div className="pt-2 flex items-center gap-2">
-          {showCancel ? (
+          {st !== 'cancelled' && st !== 'rejected' && (passed || st === 'completed') ? (
+            <div className="w-full py-2.5 px-3 text-xs font-bold text-center text-emerald-700 bg-emerald-50 rounded-lg border border-emerald-200 flex items-center justify-center gap-1.5">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+              <span>Appointment Completed</span>
+            </div>
+          ) : showCancel && !passed && st !== 'cancelled' && st !== 'rejected' ? (
             <button
               type="button"
               onClick={() => {
@@ -315,6 +335,18 @@ export const CustomerDashboard: React.FC = () => {
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-8">
+
+      {/* Back button */}
+      <div>
+        <button
+          type="button"
+          onClick={goBack}
+          className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-purple-600 cursor-pointer transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <span>Back</span>
+        </button>
+      </div>
 
       {/* Welcome Banner */}
       <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-indigo-950 rounded-3xl p-6 sm:p-8 text-white shadow-xl flex flex-col sm:flex-row sm:items-center justify-between gap-6 border border-slate-800">

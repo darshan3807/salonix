@@ -2,11 +2,11 @@ import React, { useState } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { 
   User, Store, Mail, Lock, Phone, MapPin, 
-  Sparkles, ShieldCheck, ArrowRight, AlertCircle, Building2, Scissors
+  Sparkles, ShieldCheck, ArrowRight, AlertCircle, Building2, Scissors, ArrowLeft
 } from 'lucide-react';
 
 export const SignupPage: React.FC = () => {
-  const { register, navigateTo } = useApp();
+  const { register, navigateTo, goBack } = useApp();
   const [role, setRole] = useState<'customer' | 'owner'>('customer');
   
   // Form fields
@@ -85,6 +85,18 @@ export const SignupPage: React.FC = () => {
     <div className="min-h-[90vh] py-12 px-4 sm:px-6 lg:px-8 bg-[#FAFAFA] flex items-center justify-center">
       <div className="max-w-2xl w-full bg-white p-6 sm:p-10 rounded-2xl shadow-xl shadow-slate-200/50 border border-slate-200">
         
+        {/* Back Button */}
+        <div className="mb-4">
+          <button
+            type="button"
+            onClick={goBack}
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-purple-600 transition-colors cursor-pointer"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span>Back</span>
+          </button>
+        </div>
+
         {/* Header */}
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-purple-50 text-purple-600 mb-3 border border-purple-200">

@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext.tsx';
-import { Mail, Lock, LogIn, ArrowRight, ShieldCheck, Clock, AlertCircle, Sparkles } from 'lucide-react';
+import { Mail, Lock, LogIn, ArrowRight, ShieldCheck, Clock, AlertCircle, Sparkles, ArrowLeft } from 'lucide-react';
 
 export const LoginPage: React.FC = () => {
-  const { login, navigateTo } = useApp();
+  const { login, navigateTo, goBack } = useApp();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -37,6 +37,18 @@ export const LoginPage: React.FC = () => {
     <div className="min-h-[85vh] flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8 bg-[#FAFAFA]">
       <div className="max-w-md w-full space-y-8 bg-white p-8 sm:p-10 rounded-2xl shadow-xl shadow-slate-200/50 border border-slate-200">
         
+        {/* Back Button */}
+        <div>
+          <button
+            type="button"
+            onClick={goBack}
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-purple-600 transition-colors cursor-pointer"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span>Back</span>
+          </button>
+        </div>
+
         {/* Header */}
         <div className="text-center">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-purple-50 border border-purple-200 text-purple-600 mb-4 shadow-xs">

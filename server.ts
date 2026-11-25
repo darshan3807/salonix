@@ -35,6 +35,8 @@ import {
   isStatusBlocking,
   intervalsOverlap,
   generateAvailableSlots,
+  getLocalDateString,
+  isSlotInPast,
   type BookedInterval,
 } from './src/lib/slotUtils.ts';
 
@@ -1162,6 +1164,22 @@ app.get('/api/salons/:id/slots', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Valid date query parameter (YYYY-MM-DD) is required.' });
     }
 
+    const todayStr = getLocalDateString();
+    if (date < todayStr) {
+      return res.json({
+        available: false,
+        reason: 'This date has already passed. Please select today or an upcoming date to properly select an available slot.',
+        date,
+        service: {
+          id: serviceId,
+          name: '',
+          duration: 30,
+          price: 0,
+        },
+        slots: [],
+      });
+    }
+
     if (!serviceId || typeof serviceId !== 'string') {
       return res.status(400).json({ error: 'serviceId query parameter is required.' });
     }
@@ -1245,6 +1263,32 @@ app.get('/api/salons/:id/slots', async (req: Request, res: Response) => {
       dateStr: date,
       bookedIntervals,
     });
+
+    if (slots.length === 0) {
+      return res.json({
+        available: false,
+        reason: date === todayStr
+          ? 'All booking slots for today have already passed. Please select an upcoming date to properly select a slot.'
+          : 'No available slots for this date.',
+        date,
+        salonId: salon.id,
+        salonName: salon.name,
+        service: {
+          id: service.id,
+          name: service.name,
+          duration: Number(service.duration),
+          price: Number(service.price),
+        },
+        workingHours: {
+          openingTime: salon.opening_time,
+          closingTime: salon.closing_time,
+          breakStartTime: salon.break_start_time,
+          breakEndTime: salon.break_end_time,
+        },
+        slots: [],
+        totalSlots: 0,
+      });
+    }
 
     return res.json({
       available: true,
@@ -1517,6 +1561,19 @@ app.post('/api/appointments', requireAuth, async (req: Request, res: Response) =
 
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       return res.status(400).json({ error: 'Invalid date format. Expected YYYY-MM-DD.' });
+    }
+
+    const todayStr = getLocalDateString();
+    if (date < todayStr) {
+      return res.status(400).json({
+        error: 'This date has already passed. Please select today or an upcoming date to properly select an available slot.',
+      });
+    }
+
+    if (isSlotInPast(date, startTime)) {
+      return res.status(400).json({
+        error: 'This time slot has already passed. Please properly select an upcoming time slot.',
+      });
     }
 
     // 2. Customer identity comes strictly from req.user

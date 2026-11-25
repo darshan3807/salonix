@@ -34,6 +34,7 @@ interface AppContextType {
   logout: () => void;
   updateUser: (updatedUser: User) => void;
   navigateTo: (view: ViewType, salonId?: string) => void;
+  goBack: () => void;
   navigateToSalonsWithFilters: (filters: Partial<DiscoveryFilters>) => void;
   setDiscoveryFilters: React.Dispatch<React.SetStateAction<DiscoveryFilters>>;
   refreshSalons: () => Promise<void>;
@@ -50,6 +51,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [user, setUser] = useState<User | null>(null);
   const [currentView, setCurrentView] = useState<ViewType>('home');
   const [selectedSalonId, setSelectedSalonId] = useState<string | null>(null);
+  const [navigationHistory, setNavigationHistory] = useState<{ view: ViewType; salonId: string | null }[]>([]);
   const [salons, setSalons] = useState<Salon[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [notifications, setNotifications] = useState<PlatformNotification[]>([]);
@@ -284,6 +286,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const navigateTo = (view: ViewType, salonId?: string) => {
+    setNavigationHistory((prev) => [
+      ...prev,
+      { view: currentView, salonId: selectedSalonId },
+    ]);
     if (salonId) {
       setSelectedSalonId(salonId);
     }
@@ -291,7 +297,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const goBack = () => {
+    if (navigationHistory.length > 0) {
+      const prevHistory = [...navigationHistory];
+      const previous = prevHistory.pop()!;
+      setNavigationHistory(prevHistory);
+      setSelectedSalonId(previous.salonId);
+      setCurrentView(previous.view);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else {
+      if (currentView === 'salon-detail') {
+        setCurrentView('salons');
+      } else if (currentView === 'signup') {
+        setCurrentView('login');
+      } else {
+        setCurrentView('home');
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
   const navigateToSalonsWithFilters = (filters: Partial<DiscoveryFilters>) => {
+    setNavigationHistory((prev) => [
+      ...prev,
+      { view: currentView, salonId: selectedSalonId },
+    ]);
     setDiscoveryFilters({
       search: filters.search ?? '',
       city: filters.city ?? 'All',
@@ -319,6 +349,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         logout,
         updateUser,
         navigateTo,
+        goBack,
         navigateToSalonsWithFilters,
         setDiscoveryFilters,
         refreshSalons: fetchSalons,

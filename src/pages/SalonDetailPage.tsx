@@ -2,13 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext.tsx';
 import { Salon, Service } from '../types/index.ts';
 import { apiFetch } from '../lib/api.ts';
+import { isDatePassed, getLocalDateString, isSlotInPast } from '../lib/slotUtils.ts';
 import { 
   ArrowLeft, Star, MapPin, Clock, Phone, Mail, 
   Scissors, Check, Calendar, CheckCircle2, ShieldCheck, X
 } from 'lucide-react';
 
 export const SalonDetailPage: React.FC = () => {
-  const { selectedSalonId, user, navigateTo, refreshNotifications } = useApp();
+  const { selectedSalonId, user, navigateTo, goBack, refreshNotifications } = useApp();
   const [salon, setSalon] = useState<Salon | null>(null);
   const [services, setServices] = useState<Service[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -16,8 +17,7 @@ export const SalonDetailPage: React.FC = () => {
   // Booking Modal State
   const [bookingService, setBookingService] = useState<Service | null>(null);
   const [bookingDate, setBookingDate] = useState<string>(() => {
-    const today = new Date();
-    return today.toISOString().split('T')[0];
+    return getLocalDateString();
   });
   const [selectedSlot, setSelectedSlot] = useState<string>('');
   const [availableSlots, setAvailableSlots] = useState<string[]>([]);
@@ -65,6 +65,16 @@ export const SalonDetailPage: React.FC = () => {
   const fetchAvailableSlots = async (salonId: string, serviceId: string, date: string) => {
     setIsSlotsLoading(true);
     setSlotsClosedMessage(null);
+    const todayStr = getLocalDateString();
+
+    if (date < todayStr) {
+      setAvailableSlots([]);
+      setSelectedSlot('');
+      setSlotsClosedMessage('This date has already passed. Please select today or an upcoming date to properly select an available slot.');
+      setIsSlotsLoading(false);
+      return;
+    }
+
     try {
       const res = await fetch(`/api/salons/${salonId}/slots?date=${encodeURIComponent(date)}&serviceId=${encodeURIComponent(serviceId)}`);
       if (res.ok) {
@@ -76,12 +86,23 @@ export const SalonDetailPage: React.FC = () => {
         } else {
           const slotList = (data.slots || []).map((s: any) => s.slot);
           setAvailableSlots(slotList);
-          // Keep selected slot if still valid, otherwise pick first available slot
-          setSelectedSlot((prev) => (slotList.includes(prev) ? prev : (slotList[0] || '')));
+          if (slotList.length === 0) {
+            if (date === todayStr) {
+              setSlotsClosedMessage('All booking slots for today have already passed. Please select an upcoming date to properly select a slot.');
+            } else {
+              setSlotsClosedMessage('No slots available for this date. Please choose another date.');
+            }
+            setSelectedSlot('');
+          } else {
+            // Keep selected slot if still valid, otherwise pick first available slot
+            setSelectedSlot((prev) => (slotList.includes(prev) ? prev : (slotList[0] || '')));
+          }
         }
       } else {
+        const errData = await res.json().catch(() => ({}));
         setAvailableSlots([]);
         setSelectedSlot('');
+        setSlotsClosedMessage(errData.error || 'Unable to fetch slots.');
       }
     } catch (e) {
       console.error('Error fetching available slots:', e);
@@ -105,8 +126,20 @@ export const SalonDetailPage: React.FC = () => {
       setErrorMsg('Please enter your name, phone number, and choose an available time slot.');
       return;
     }
+
+    const todayStr = getLocalDateString();
+    if (bookingDate < todayStr) {
+      setErrorMsg('This date has already passed. Please select today or an upcoming date to properly select an available slot.');
+      return;
+    }
+
     if (!selectedSlot) {
       setErrorMsg('Please select an available time slot.');
+      return;
+    }
+
+    if (isSlotInPast(bookingDate, selectedSlot)) {
+      setErrorMsg('This time slot has already passed. Please properly select an upcoming time slot.');
       return;
     }
 
@@ -160,10 +193,12 @@ export const SalonDetailPage: React.FC = () => {
       <div className="p-20 text-center space-y-4">
         <h2 className="text-xl font-bold text-slate-900">Salon Not Found</h2>
         <button
-          onClick={() => navigateTo('salons')}
-          className="px-4 py-2 bg-purple-600 text-white rounded-lg cursor-pointer"
+          type="button"
+          onClick={goBack}
+          className="px-4 py-2 bg-purple-600 text-white rounded-lg cursor-pointer inline-flex items-center gap-1.5"
         >
-          Back to Salons
+          <ArrowLeft className="w-4 h-4" />
+          <span>Back</span>
         </button>
       </div>
     );
@@ -175,11 +210,12 @@ export const SalonDetailPage: React.FC = () => {
       {/* Back button */}
       <div>
         <button
-          onClick={() => navigateTo('salons')}
+          type="button"
+          onClick={goBack}
           className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-purple-600 cursor-pointer transition-colors"
         >
           <ArrowLeft className="w-4 h-4" />
-          <span>Back to All Salons</span>
+          <span>Back</span>
         </button>
       </div>
 
@@ -319,7 +355,9 @@ export const SalonDetailPage: React.FC = () => {
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Status:</span>
-                    <span className="font-bold uppercase text-amber-700">{bookingSuccess.status}</span>
+                    <span className={`font-bold uppercase ${isDatePassed(bookingSuccess.date) ? 'text-emerald-700' : 'text-amber-700'}`}>
+                      {isDatePassed(bookingSuccess.date) ? 'Appointment Completed' : bookingSuccess.status}
+                    </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Estimated Price:</span>
@@ -385,8 +423,18 @@ export const SalonDetailPage: React.FC = () => {
                     <input
                       type="date"
                       required
+                      min={getLocalDateString()}
                       value={bookingDate}
-                      onChange={(e) => setBookingDate(e.target.value)}
+                      onChange={(e) => {
+                        const newDate = e.target.value;
+                        setBookingDate(newDate);
+                        const todayStr = getLocalDateString();
+                        if (newDate < todayStr) {
+                          setErrorMsg('This date has already passed. Please select today or an upcoming date to properly select an available slot.');
+                        } else {
+                          setErrorMsg(null);
+                        }
+                      }}
                       className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-purple-500"
                     />
                   </div>

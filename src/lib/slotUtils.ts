@@ -196,8 +196,20 @@ export function generateAvailableSlots(options: GenerateSlotsOptions): SlotResul
   const step = Math.max(15, slotStepMinutes || 30);
   const availableSlots: SlotResult[] = [];
 
+  const todayStr = getLocalDateString();
+  if (dateStr < todayStr) {
+    return [];
+  }
+  const isToday = dateStr === todayStr;
+  const currentMinutes = getCurrentTimeMinutes();
+
   for (let start = openMin; start + serviceDurationMinutes <= closeMin; start += step) {
     const end = start + serviceDurationMinutes;
+
+    // Check if slot has already passed for today
+    if (isToday && start <= currentMinutes) {
+      continue;
+    }
 
     // Check overlap with salon break
     if (hasBreak && intervalsOverlap(start, end, breakStart!, breakEnd!)) {
@@ -224,3 +236,95 @@ export function generateAvailableSlots(options: GenerateSlotsOptions): SlotResul
 
   return availableSlots;
 }
+
+/**
+ * Returns the current local date in YYYY-MM-DD format (accounting for timezone).
+ */
+export function getLocalDateString(d: Date = new Date()): string {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Returns the current local time in minutes from midnight.
+ */
+export function getCurrentTimeMinutes(d: Date = new Date()): number {
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+/**
+ * Checks whether a given slot for a date is in the past compared to now.
+ * For example: if date is before today, returns true.
+ * If date is today and time is <= current time, returns true.
+ */
+export function isSlotInPast(dateStr: string | null | undefined, timeStr: string | null | undefined): boolean {
+  if (!dateStr || !timeStr) return false;
+  const todayStr = getLocalDateString();
+  const cleanDate = dateStr.trim();
+
+  let isoDate = cleanDate;
+  if (cleanDate.includes('/')) {
+    const parts = cleanDate.split('/');
+    if (parts[0].length !== 4) {
+      isoDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    }
+  } else if (cleanDate.includes('-')) {
+    const parts = cleanDate.split('-');
+    if (parts[0].length !== 4) {
+      isoDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    }
+  }
+
+  if (isoDate < todayStr) return true;
+  if (isoDate > todayStr) return false;
+
+  // It is today: check slot start time against current local time
+  const slotMinutes = timeStringToMinutes(timeStr);
+  if (slotMinutes === null) return true;
+  const nowMinutes = getCurrentTimeMinutes();
+  return slotMinutes <= nowMinutes;
+}
+
+/**
+ * Checks whether a given appointment date has passed compared to today.
+ * Handles formats: YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, YYYY/MM/DD, or ISO strings.
+ */
+export function isDatePassed(dateStr: string | null | undefined): boolean {
+  if (!dateStr || typeof dateStr !== 'string') return false;
+  const clean = dateStr.trim();
+  if (!clean) return false;
+
+  let aptDate: Date;
+  if (clean.includes('/')) {
+    const parts = clean.split('/');
+    if (parts[0].length === 4) {
+      // YYYY/MM/DD
+      aptDate = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    } else {
+      // DD/MM/YYYY
+      aptDate = new Date(Number(parts[2]), Number(parts[1]) - 1, Number(parts[0]));
+    }
+  } else if (clean.includes('-')) {
+    const parts = clean.split('-');
+    if (parts[0].length === 4) {
+      // YYYY-MM-DD
+      aptDate = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    } else {
+      // DD-MM-YYYY
+      aptDate = new Date(Number(parts[2]), Number(parts[1]) - 1, Number(parts[0]));
+    }
+  } else {
+    aptDate = new Date(clean);
+  }
+
+  if (isNaN(aptDate.getTime())) return false;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  aptDate.setHours(0, 0, 0, 0);
+
+  return aptDate.getTime() < today.getTime();
+}
+
